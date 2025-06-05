@@ -6,7 +6,10 @@ DEFAULT_TOKENS = [
     "TRXUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT", "NEARUSDT", "ATOMUSDT",
     "ARBUSDT", "OPUSDT", "INJUSDT", "SUIUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT",
     "TRUMPUSDT", "FETUSDT", "SUSHIUSDT", "APTUSDT", "WLDUSDT", "TIAUSDT", "TAOUSDT",
-    "ETCUSDT", "AAVEUSDT"
+    "ETCUSDT", "AAVEUSDT",
+    # New additions - 10 tokens for enhanced coverage
+    "LPTUSDT", "ENAUSDT", "RVNUSDT", "VIRTUALUSDT", "TRBUSDT",
+    "LDOUSDT", "UNIUSDT", "FILUSDT", "MASKUSDT", "EIGENUSDT"
 ]
 
 # Technical Analysis Parameters
@@ -28,4 +31,3 @@ LOG_FILE_OVERRIDE = None
 
 # Logging
 LOG_LEVEL = "INFO"  # e.g., "DEBUG", "INFO", "WARNING", "ERROR"
-
