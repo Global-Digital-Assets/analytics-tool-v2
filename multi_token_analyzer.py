@@ -1,15 +1,38 @@
+#!/usr/bin/env python3
+"""
+Enhanced Multi-Token Analytics Tool with Data-Driven Scoring
+Version: enhanced_v2.5_institutional_cascade
+Features: ML-based scoring, cross-sectional ranking, correlation penalties, regime gating
+"""
+
 import asyncio
-import json
+import aiohttp
 import logging
 import sqlite3
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
-import os
 import pandas as pd
 import numpy as np
-import aiohttp
+import json
+import time
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional, Tuple, Any
+import os
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# Enhanced imports for institutional-grade features
+try:
+    from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import classification_report
+    import joblib
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    print("⚠️ ML libraries not available. Using rule-based scoring.")
 
 # --- Configuration ---
 # Attempt to import from config.py, with fallbacks if not found or incomplete
@@ -34,7 +57,16 @@ try:
         LOG_LEVEL as CFG_LOG_LEVEL,
         OUTPUT_FILE_OVERRIDE as CFG_OUTPUT_FILE_OVERRIDE,
         DEBUG_FILE_OVERRIDE as CFG_DEBUG_FILE_OVERRIDE,
-        LOG_FILE_OVERRIDE as CFG_LOG_FILE_OVERRIDE
+        LOG_FILE_OVERRIDE as CFG_LOG_FILE_OVERRIDE,
+        ML_MODEL_PATH as CFG_ML_MODEL_PATH,
+        SCALER_PATH as CFG_SCALER_PATH,
+        CORRELATION_WINDOW as CFG_CORRELATION_WINDOW,
+        CORRELATION_PENALTY_FACTOR as CFG_CORRELATION_PENALTY_FACTOR,
+        REGIME_MULTIPLIER_BEAR as CFG_REGIME_MULTIPLIER_BEAR,
+        REGIME_MULTIPLIER_BULL as CFG_REGIME_MULTIPLIER_BULL,
+        PERCENTILE_RANKING as CFG_PERCENTILE_RANKING,
+        DATA_DRIVEN_SCORING as CFG_DATA_DRIVEN_SCORING,
+        MIN_TRAINING_SAMPLES as CFG_MIN_TRAINING_SAMPLES
     )
     RSI_PERIOD = CFG_RSI_PERIOD
     RSI_OVERSOLD = CFG_RSI_OVERSOLD
@@ -44,6 +76,7 @@ try:
     DEFAULT_TOKENS = CFG_DEFAULT_TOKENS
     ANALYSIS_CANDLE_LIMIT = CFG_ANALYSIS_CANDLE_LIMIT
     API_TIMEOUT = CFG_API_TIMEOUT
+    ANALYSIS_OUTPUT_FILE = 'multi_token_analysis.json'
     DB_PATH = CFG_DB_PATH_OVERRIDE if CFG_DB_PATH_OVERRIDE else DB_PATH_DEFAULT
     LOG_LEVEL = CFG_LOG_LEVEL
     OUTPUT_FILE = CFG_OUTPUT_FILE_OVERRIDE if CFG_OUTPUT_FILE_OVERRIDE else OUTPUT_FILE_DEFAULT
@@ -53,6 +86,16 @@ try:
     if TOKEN_LIST_URL is None:
         TOKEN_LIST_URL = ""
 
+    # Enhanced institutional-grade configuration
+    ML_MODEL_PATH = CFG_ML_MODEL_PATH
+    SCALER_PATH = CFG_SCALER_PATH
+    CORRELATION_WINDOW = CFG_CORRELATION_WINDOW
+    CORRELATION_PENALTY_FACTOR = CFG_CORRELATION_PENALTY_FACTOR
+    REGIME_MULTIPLIER_BEAR = CFG_REGIME_MULTIPLIER_BEAR
+    REGIME_MULTIPLIER_BULL = CFG_REGIME_MULTIPLIER_BULL
+    PERCENTILE_RANKING = CFG_PERCENTILE_RANKING
+    DATA_DRIVEN_SCORING = CFG_DATA_DRIVEN_SCORING
+    MIN_TRAINING_SAMPLES = CFG_MIN_TRAINING_SAMPLES
 except ImportError:
     RSI_PERIOD = 14
     RSI_OVERSOLD = 30
@@ -62,11 +105,35 @@ except ImportError:
     DEFAULT_TOKENS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
     ANALYSIS_CANDLE_LIMIT = 1500
     API_TIMEOUT = 10
+    ANALYSIS_OUTPUT_FILE = 'multi_token_analysis.json'
     DB_PATH = DB_PATH_DEFAULT
     LOG_LEVEL = "INFO"
     OUTPUT_FILE = OUTPUT_FILE_DEFAULT
     DEBUG_FILE = DEBUG_FILE_DEFAULT
     LOG_FILE = LOG_FILE_DEFAULT
+
+    # Enhanced institutional-grade configuration
+    ML_MODEL_PATH = 'scoring_model.pkl'
+    SCALER_PATH = 'feature_scaler.pkl'
+    CORRELATION_WINDOW = 90
+    CORRELATION_PENALTY_FACTOR = 0.3
+    REGIME_MULTIPLIER_BEAR = 0.8
+    REGIME_MULTIPLIER_BULL = 0.8
+    PERCENTILE_RANKING = True
+    DATA_DRIVEN_SCORING = ML_AVAILABLE
+    MIN_TRAINING_SAMPLES = 1000
+
+# Threshold constants
+BUY_THRESHOLD = 60  # Score threshold for buy signals
+
+# Custom JSON encoder to handle numpy types
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.bool_, np.generic)):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 # --- Logging Setup ---
 log_dir = os.path.dirname(LOG_FILE)
@@ -89,23 +156,40 @@ class TokenOpportunity:
     symbol: str
     current_price: float = 0.0
     price_change_1h: float = 0.0
-    price_change_4h: float = 0.0
+    price_change_4h: float = 0.0 
     price_change_24h: float = 0.0
-    rsi: float = 50.0
+    rsi: float = 0.0
     volume_spike: bool = False
     support_bounce: bool = False
+    resistance_rejection: bool = False
     multi_timeframe_alignment: bool = False
     composite_score: float = 0.0
-    entry_recommendation: str = "WAIT"
+    entry_recommendation: str = "NEUTRAL"
     volatility: float = 0.0
     returns_vec: List[float] = field(default_factory=list)
-    # Simplified binary recommendations
-    simple_long_action: str = "DON'T_BUY_LONG"  # BUY_LONG or DON'T_BUY_LONG
-    simple_short_action: str = "DON'T_SHORT"    # SHORT or DON'T_SHORT
+    # Enhanced scoring fields
     long_score: float = 0.0
     short_score: float = 0.0
+    raw_long_score: float = 0.0  # Before correlation penalty and regime adjustment
+    raw_short_score: float = 0.0
+    percentile_long: float = 0.0  # Cross-sectional percentile rank (0-100)
+    percentile_short: float = 0.0
+    correlation_btc: float = 0.0  # Rolling correlation with BTC
+    correlation_eth: float = 0.0  # Rolling correlation with ETH
+    correlation_penalty: float = 0.0  # Applied penalty for high correlation
+    regime_multiplier: float = 1.0  # Market regime adjustment factor
     direction: str = "NEUTRAL"
-    resistance_rejection: bool = False
+    # Simplified binary recommendations  
+    simple_long_action: str = "DON'T_BUY_LONG"  # BUY_LONG or DON'T_BUY_LONG
+    simple_short_action: str = "DON'T_SHORT"    # SHORT or DON'T_SHORT
+    # Feature engineering for ML
+    feature_vector: List[float] = field(default_factory=list)
+    ml_confidence: float = 0.0  # Model confidence score (0-1)
+    scoring_method: str = "rule_based"  # "rule_based", "ml_model", or "hybrid"
+    # ML prediction fields
+    ml_probability: float = 0.0
+    ml_signal: str = "NEUTRAL"
+    confidence_boost: bool = False
 
 # --- Regime Detection ---
 class RegimeDetector:
@@ -150,74 +234,293 @@ class RegimeDetector:
             logger.error(f"Error in regime detection: {e}", exc_info=True)
             return {"regime": "error", "confidence": 0.0, "details": str(e)}
 
+# --- Enhanced Scoring Engine ---
+class EnhancedScoringEngine:
+    """Institutional-grade scoring engine with ML capabilities"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.model = None
+        self.scaler = None
+        self.is_trained = False
+        self.feature_names = [
+            'rsi', 'price_1h', 'price_4h', 'price_24h', 'volume_spike_factor',
+            'support_distance', 'resistance_distance', 'timeframe_bullish_count',
+            'timeframe_bearish_count', 'volatility', 'momentum_3d', 'momentum_7d'
+        ]
+        self._load_model()
+    
+    def _load_model(self):
+        """Load trained model and scaler if available"""
+        try:
+            if os.path.exists(ML_MODEL_PATH) and os.path.exists(SCALER_PATH):
+                self.model = joblib.load(ML_MODEL_PATH)
+                self.scaler = joblib.load(SCALER_PATH)
+                self.is_trained = True
+                logger.info("✅ Loaded trained ML model and scaler")
+            else:
+                logger.info("📊 No trained model found - will use rule-based scoring")
+        except Exception as e:
+            logger.warning(f"⚠️ Error loading ML model: {e}")
+            self.is_trained = False
+    
+    def extract_features(self, df: pd.DataFrame, current_price: float) -> List[float]:
+        """Extract feature vector for ML model"""
+        features = []
+        
+        if len(df) < 20:
+            return [0.0] * len(self.feature_names)
+        
+        try:
+            # RSI
+            rsi = self._calculate_rsi(df['close'])
+            features.append(rsi)
+            
+            # Price changes
+            price_1h = ((current_price - df["close"].iloc[-60]) / df["close"].iloc[-60] * 100) if len(df) >= 61 else 0.0
+            price_4h = ((current_price - df["close"].iloc[-240]) / df["close"].iloc[-240] * 100) if len(df) >= 241 else 0.0  
+            price_24h = ((current_price - df["close"].iloc[-1440]) / df["close"].iloc[-1440] * 100) if len(df) >= 1441 else 0.0
+            features.extend([price_1h, price_4h, price_24h])
+            
+            # Volume spike factor
+            rolling_mean_vol = df["volume"].rolling(20).mean()
+            current_volume = df["volume"].iloc[-2] if len(df) >= 2 else df["volume"].iloc[-1]
+            avg_volume = rolling_mean_vol.iloc[-2] if len(rolling_mean_vol) >= 2 else rolling_mean_vol.iloc[-1]
+            volume_spike_factor = current_volume / avg_volume if avg_volume > 0 else 1.0
+            features.append(volume_spike_factor)
+            
+            # Support/Resistance distances
+            support_levels = self._detect_support_levels(df)
+            resistance_levels = self._detect_resistance_levels(df)
+            
+            support_distance = min([abs(current_price - s) / current_price for s in support_levels]) if support_levels else 0.1
+            resistance_distance = min([abs(current_price - r) / current_price for r in resistance_levels]) if resistance_levels else 0.1
+            features.extend([support_distance, resistance_distance])
+            
+            # Timeframe alignment
+            timeframe_bullish = sum([price_1h > 0, price_4h > 0, price_24h > -2])
+            timeframe_bearish = sum([price_1h < 0, price_4h < 0, price_24h < 2])
+            features.extend([timeframe_bullish, timeframe_bearish])
+            
+            # Volatility
+            volatility = df['close'].pct_change().rolling(20).std().iloc[-1] * 100
+            features.append(volatility if not pd.isna(volatility) else 0.0)
+            
+            # Momentum indicators
+            momentum_3d = ((current_price - df["close"].iloc[-4320]) / df["close"].iloc[-4320] * 100) if len(df) >= 4321 else 0.0
+            momentum_7d = ((current_price - df["close"].iloc[-10080]) / df["close"].iloc[-10080] * 100) if len(df) >= 10081 else 0.0
+            features.extend([momentum_3d, momentum_7d])
+            
+        except Exception as e:
+            logger.warning(f"Error extracting features: {e}")
+            features = [0.0] * len(self.feature_names)
+        
+        return features[:len(self.feature_names)]
+    
+    def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
+        """Calculate RSI"""
+        if len(prices) < period + 1:
+            return 50.0
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50.0
+    
+    def _detect_support_levels(self, df: pd.DataFrame) -> List[float]:
+        """Detect support levels"""
+        if len(df) < 50:
+            return []
+        
+        lows = df['low'].rolling(10).min()
+        support_levels = []
+        
+        for i in range(10, len(lows) - 10):
+            if lows.iloc[i] == df['low'].iloc[i]:
+                support_levels.append(df['low'].iloc[i])
+        
+        return list(set(support_levels))[-5:]  # Last 5 support levels
+    
+    def _detect_resistance_levels(self, df: pd.DataFrame) -> List[float]:
+        """Detect resistance levels"""
+        if len(df) < 50:
+            return []
+        
+        highs = df['high'].rolling(10).max()
+        resistance_levels = []
+        
+        for i in range(10, len(highs) - 10):
+            if highs.iloc[i] == df['high'].iloc[i]:
+                resistance_levels.append(df['high'].iloc[i])
+        
+        return list(set(resistance_levels))[-5:]  # Last 5 resistance levels
+    
+    def calculate_correlation_penalty(self, symbol: str, returns_vec: List[float]) -> Tuple[float, float, float]:
+        """Calculate correlation with BTC/ETH and apply penalty"""
+        try:
+            if len(returns_vec) < CORRELATION_WINDOW:
+                return 0.0, 0.0, 0.0
+            
+            # Get BTC and ETH returns for correlation
+            btc_returns = self._get_correlation_returns('BTCUSDT')
+            eth_returns = self._get_correlation_returns('ETHUSDT')
+            
+            if not btc_returns or not eth_returns:
+                return 0.0, 0.0, 0.0
+            
+            # Calculate correlations
+            symbol_returns = pd.Series(returns_vec[-CORRELATION_WINDOW:])
+            btc_corr = symbol_returns.corr(pd.Series(btc_returns[-CORRELATION_WINDOW:]))
+            eth_corr = symbol_returns.corr(pd.Series(eth_returns[-CORRELATION_WINDOW:]))
+            
+            # Calculate penalty based on average correlation
+            avg_correlation = (abs(btc_corr) + abs(eth_corr)) / 2
+            penalty = avg_correlation * CORRELATION_PENALTY_FACTOR
+            
+            return btc_corr if not pd.isna(btc_corr) else 0.0, eth_corr if not pd.isna(eth_corr) else 0.0, penalty
+            
+        except Exception as e:
+            logger.warning(f"Error calculating correlation for {symbol}: {e}")
+            return 0.0, 0.0, 0.0
+    
+    def _get_correlation_returns(self, symbol: str) -> List[float]:
+        """Get returns vector for correlation calculation"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            query = """
+                SELECT close FROM candles 
+                WHERE symbol = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            """
+            df = pd.read_sql_query(query, conn, params=(symbol, CORRELATION_WINDOW + 1))
+            conn.close()
+            
+            if len(df) < 2:
+                return []
+            
+            returns = df['close'].pct_change().dropna().tolist()
+            return returns[-CORRELATION_WINDOW:] if len(returns) >= CORRELATION_WINDOW else returns
+            
+        except Exception as e:
+            logger.warning(f"Error getting returns for {symbol}: {e}")
+            return []
+    
+    def predict_scores(self, features: List[float]) -> Tuple[float, float, float]:
+        """Predict long/short scores using ML model"""
+        if not self.is_trained or not ML_AVAILABLE:
+            return 0.0, 0.0, 0.0
+        
+        try:
+            # Reshape and scale features
+            X = np.array(features).reshape(1, -1)
+            X_scaled = self.scaler.transform(X)
+            
+            # Get prediction probabilities
+            proba = self.model.predict_proba(X_scaled)[0]
+            
+            # Convert to scores (0-100)
+            long_score = int(proba[1] * 100) if len(proba) > 1 else 0  # Positive class probability
+            short_score = int(proba[0] * 100) if len(proba) > 0 else 0  # Negative class probability
+            confidence = max(proba)
+            
+            return float(long_score), float(short_score), float(confidence)
+            
+        except Exception as e:
+            logger.warning(f"Error in ML prediction: {e}")
+            return 0.0, 0.0, 0.0
+
 # --- Main Analyzer Class ---
 class EnhancedTokenAnalyzer:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.regime_detector = RegimeDetector(db_path)
         self.token_list = DEFAULT_TOKENS
+        self.scoring_engine = EnhancedScoringEngine(db_path)
 
     def _get_db_connection(self):
         return sqlite3.connect(self.db_path)
 
-    async def _fetch_historical_data_from_db(self, symbol: str, limit: int = ANALYSIS_CANDLE_LIMIT) -> Optional[pd.DataFrame]:
+    async def _fetch_historical_data_from_db(self, symbol: str) -> pd.DataFrame:
+        """Fetch historical data from database"""
         try:
-            conn = self._get_db_connection()
-            two_days_ago_ms = (datetime.now() - timedelta(days=2)).timestamp() * 1000
-            query = f"""
-                SELECT timestamp, open, high, low, close, volume FROM candles
-                WHERE symbol = ? AND timestamp >= ?
-                ORDER BY timestamp DESC LIMIT ?
+            query = """
+                SELECT open, high, low, close, volume, timestamp
+                FROM candles 
+                WHERE symbol = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
             """
-            df = pd.read_sql_query(query, conn, params=(symbol, two_days_ago_ms, limit))
-            conn.close()
-
+            
+            with sqlite3.connect(self.db_path) as conn:
+                df = pd.read_sql_query(query, conn, params=(symbol, ANALYSIS_CANDLE_LIMIT))
+                
             if df.empty:
-                logger.warning(f"No data found in DB for {symbol} within last 2 days.")
+                logger.warning(f"❌ No historical data found for {symbol}")
                 return None
-
-            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
-            df = df.iloc[::-1].reset_index(drop=True)
+                
+            # Convert timestamp and sort chronologically  
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            
+            logger.debug(f"📊 Loaded {len(df)} candles for {symbol}")
             return df
+            
         except Exception as e:
-            logger.error(f"DB Error fetching {symbol}: {e}", exc_info=True)
+            logger.error(f"❌ Database error for {symbol}: {e}")
             return None
 
+    def _get_historical_data(self, symbol: str) -> pd.DataFrame:
+        """Legacy method for backwards compatibility"""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self._fetch_historical_data_from_db(symbol))
+
     async def validate_symbols(self, session: aiohttp.ClientSession) -> List[str]:
-        """Validate symbols with clean URL checking"""
-        
-        # Only attempt HTTP request if TOKEN_LIST_URL is a valid URL
-        if (TOKEN_LIST_URL and 
-            isinstance(TOKEN_LIST_URL, str) and 
-            (TOKEN_LIST_URL.startswith("http://") or TOKEN_LIST_URL.startswith("https://"))):
+        """Validate symbols against Binance API, with proper URL validation"""
+        # Guard against invalid URLs to prevent aiohttp.InvalidURL noise
+        if not TOKEN_LIST_URL or not TOKEN_LIST_URL.startswith(("http://", "https://")):
+            logger.info("Using DEFAULT_TOKENS (30) - no valid TOKEN_LIST_URL configured.")
+            self.token_list = DEFAULT_TOKENS
+            return DEFAULT_TOKENS
             
-            try:
-                async with session.get(TOKEN_LIST_URL, timeout=API_TIMEOUT) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        valid_symbols_set = {
-                            s['symbol'] for s in data.get('symbols', []) 
-                            if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')
-                        }
-                        validated_list = [s for s in DEFAULT_TOKENS if s in valid_symbols_set]
-                        
-                        if validated_list:
-                            logger.info(f"✅ Validated {len(validated_list)} symbols from TOKEN_LIST_URL")
-                            self.token_list = validated_list
-                            return validated_list
-                        else:
-                            logger.warning("⚠️ No DEFAULT_TOKENS found in exchange info. Using defaults.")
-                    else:
-                        logger.warning(f"⚠️ TOKEN_LIST_URL returned status {response.status}. Using defaults.")
-            except Exception as e:
-                logger.warning(f"⚠️ Error fetching TOKEN_LIST_URL: {e}. Using defaults.")
+        try:
+            async with session.get(TOKEN_LIST_URL, timeout=API_TIMEOUT) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    valid_symbols_set = {s['symbol'] for s in data.get('symbols', []) if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')}
+                    
+                    validated_list = [s for s in DEFAULT_TOKENS if s in valid_symbols_set]
+                    if not validated_list and DEFAULT_TOKENS: 
+                        logger.warning(f"None of the DEFAULT_TOKENS ({DEFAULT_TOKENS}) are currently valid trading USDT pairs. Check config.")
+                    
+                    logger.info(f"Validated {len(validated_list)} symbols from DEFAULT_TOKENS for analysis.")
+                    self.token_list = validated_list if validated_list else DEFAULT_TOKENS 
+                    return self.token_list
+                else:
+                    logger.warning(f"Failed to fetch exchange info (status {response.status}). Using configured DEFAULT_TOKENS: {DEFAULT_TOKENS}")
+        except Exception as e:
+            logger.error(f"Error validating symbols: {e}. Using configured DEFAULT_TOKENS: {DEFAULT_TOKENS}")
         
-        # Default fallback - no noisy errors!
-        logger.info(f"✅ Using configured DEFAULT_TOKENS ({len(DEFAULT_TOKENS)} tokens)")
-        self.token_list = DEFAULT_TOKENS
+        self.token_list = DEFAULT_TOKENS 
         return DEFAULT_TOKENS
 
-
+    async def _fetch_current_price(self, symbol: str, session: aiohttp.ClientSession) -> float:
+        """Fetch current price for a symbol from Binance API"""
+        try:
+            url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with session.get(url, timeout=timeout) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return float(data['price'])
+                else:
+                    logger.error(f"❌ API error for {symbol}: {response.status}")
+                    return 0.0
+        except Exception as e:
+            logger.error(f"❌ Error fetching current price for {symbol}: {e}")
+            return 0.0
 
     def _calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> float:
         if prices is None or len(prices) < period + 1: 
@@ -293,101 +596,205 @@ class EnhancedTokenAnalyzer:
             entry_recommendation="INSUFFICIENT_DATA"
         )
 
-    async def analyze_token_async(self, session: aiohttp.ClientSession, symbol: str) -> TokenOpportunity:
-        df = await self._fetch_historical_data_from_db(symbol)
-        if df is None or len(df) < 25:
-            logger.warning(f"Insufficient data for {symbol} after DB fetch for analysis.")
-            return self._create_empty_opportunity(symbol)
-        
+    async def analyze_token_async(self, symbol: str, session: aiohttp.ClientSession) -> Optional[TokenOpportunity]:
+        """Enhanced analysis with institutional-grade scoring"""
         try:
-            current_price = float(df["close"].iloc[-1])
-            rsi_val = self._calculate_rsi(df["close"])
+            # Fetch current price
+            current_price = await self._fetch_current_price(symbol, session)
+            if current_price is None:
+                logger.warning(f"❌ Could not fetch current price for {symbol}")
+                return None
 
-            price_1h = ((current_price - df["close"].iloc[-60]) / df["close"].iloc[-60] * 100) if len(df) >= 61 and df["close"].iloc[-60] != 0 else 0.0
-            price_4h = ((current_price - df["close"].iloc[-240]) / df["close"].iloc[-240] * 100) if len(df) >= 241 and df["close"].iloc[-240] != 0 else 0.0
-            price_24h = ((current_price - df["close"].iloc[-1440]) / df["close"].iloc[-1440] * 100) if len(df) >= 1441 and df["close"].iloc[-1440] != 0 else 0.0
-            
-            volatility_val = self.calculate_volatility(df["close"])
-            returns_vec_val = self.calculate_returns_vector(df["close"])
-            
-            long_score, short_score = 0, 0
-            current_volume_spike_flag, support_bounce_flag, mta_bullish_flag = False, False, False
-            resistance_rejection_flag, mta_bearish_flag = False, False
+            # Get historical data
+            df = await self._fetch_historical_data_from_db(symbol)
+            if df is None or len(df) < 50:
+                logger.warning(f"❌ Insufficient data for {symbol}")
+                return None
 
-            if len(df) >= 20:
-                volume_idx = -2 if len(df['volume']) >= 2 else -1
-                rolling_mean_vol = df["volume"].rolling(20).mean()
-                avg_volume_idx = -2 if len(rolling_mean_vol) >=2 else -1
-                current_candle_volume = df["volume"].iloc[volume_idx]
-                avg_volume_20 = rolling_mean_vol.iloc[avg_volume_idx] if not rolling_mean_vol.empty and avg_volume_idx < 0 and abs(avg_volume_idx) <= len(rolling_mean_vol) else 0
+            # Calculate price changes
+            price_1h = ((current_price - df["close"].iloc[-60]) / df["close"].iloc[-60] * 100) if len(df) >= 61 else 0.0
+            price_4h = ((current_price - df["close"].iloc[-240]) / df["close"].iloc[-240] * 100) if len(df) >= 241 else 0.0  
+            price_24h = ((current_price - df["close"].iloc[-1440]) / df["close"].iloc[-1440] * 100) if len(df) >= 1441 else 0.0
 
+            # Enhanced feature extraction
+            features = self.scoring_engine.extract_features(df, current_price)
+            
+            # Calculate RSI
+            rsi_val = self._calculate_rsi(df['close'])
+            
+            # Calculate returns for correlation
+            returns_vec = df['close'].pct_change().dropna().tolist()[-CORRELATION_WINDOW:] if len(df) > CORRELATION_WINDOW else []
+            
+            # Volume analysis
+            rolling_mean_vol = df["volume"].rolling(20).mean()
+            current_candle_volume = df["volume"].iloc[-2] if len(df) >= 2 else df["volume"].iloc[-1]
+            avg_volume_20 = rolling_mean_vol.iloc[-2] if len(rolling_mean_vol) >= 2 else rolling_mean_vol.iloc[-1]
+            volume_spike = avg_volume_20 > 0 and current_candle_volume > (avg_volume_20 * VOLUME_SPIKE_FACTOR)
 
-                if avg_volume_20 > 0 and current_candle_volume > (avg_volume_20 * VOLUME_SPIKE_FACTOR):
-                    current_volume_spike_flag = True
-                    if rsi_val < RSI_OVERSOLD + 5: long_score += 40
-                    if rsi_val > RSI_OVERBOUGHT - 5: short_score += 40
-            
-            support_levels = self.detect_support_levels(df)
-            if support_levels and current_price > 0:
-                nearest_support = min(support_levels, key=lambda x: abs(x - current_price))
-                if abs(current_price - nearest_support) / current_price < 0.01 and price_1h > -1:
-                    long_score += 30
-                    support_bounce_flag = True
-            
+            # Technical analysis conditions
+            support_bounce_condition = self._check_support_bounce(df, current_price)
+            resistance_rejection_condition = self._check_resistance_rejection(df, current_price)
+            multi_timeframe_alignment = self._check_multi_timeframe_alignment(df, current_price)
+            failed_breakout_condition = self._check_failed_breakout(df, current_price)
+
+            # Count timeframe alignments
             bullish_timeframes = sum([price_1h > 0, price_4h > 0, price_24h > -2])
-            if bullish_timeframes >= 2:
-                long_score += 25
-                mta_bullish_flag = True
-            
-            resistance_levels = self.detect_resistance_levels(df)
-            if resistance_levels and current_price > 0:
-                nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
-                if abs(current_price - nearest_resistance) / current_price < 0.01 and price_1h < 1:
-                    short_score += 30
-                    resistance_rejection_flag = True
-            
             bearish_timeframes = sum([price_1h < 0, price_4h < 0, price_24h < 2])
-            if bearish_timeframes >= 2:
-                short_score += 25
-                mta_bearish_flag = True
-            
-            if len(df) >= 50:
-                rolling_high_window = min(20, len(df) -1)
-                idx_high_20 = -(rolling_high_window) if rolling_high_window > 0 else -1
-                df_rolling_high = df["high"].rolling(rolling_high_window).max()
-                high_20 = df_rolling_high.iloc[idx_high_20] if rolling_high_window > 0 and not df_rolling_high.empty and abs(idx_high_20) <= len(df_rolling_high) else current_price
-                
-                recent_high_window = min(5, len(df))
-                recent_high = df["high"].tail(recent_high_window).max() if recent_high_window > 0 else current_price
-                if recent_high > high_20 * 0.995 and current_price < high_20:
-                    short_score += 20
-            
-            BUY_THRESHOLD = 60
-            direction_val, entry_recommendation_val = "NEUTRAL", "NEUTRAL"
-            if long_score >= BUY_THRESHOLD and short_score < 40: direction_val, entry_recommendation_val = "LONG", "BUY_LONG"
-            elif short_score >= BUY_THRESHOLD and long_score < 40: direction_val, entry_recommendation_val = "SHORT", "BUY_SHORT"
-            elif long_score >= 30 and short_score < 30: direction_val, entry_recommendation_val = "LONG", "WAIT_LONG"
-            elif short_score >= 30 and long_score < 30: direction_val, entry_recommendation_val = "SHORT", "WAIT_SHORT"
-            
-            composite_score_val = max(long_score, short_score)
 
-            # Simplified binary recommendations
-            simple_long_action_val = "BUY_LONG" if long_score >= BUY_THRESHOLD else "DON'T_BUY_LONG"
-            simple_short_action_val = "SHORT" if short_score >= BUY_THRESHOLD else "DON'T_SHORT"
+            # Initialize scoring variables
+            raw_long_score, raw_short_score = 0.0, 0.0
+            ml_confidence = 0.0
+            scoring_method = "rule_based"
+
+            # Data-driven scoring vs rule-based
+            if DATA_DRIVEN_SCORING and self.scoring_engine.is_trained:
+                # Use ML model
+                ml_long, ml_short, ml_confidence = self.scoring_engine.predict_scores(features)
+                raw_long_score, raw_short_score = ml_long, ml_short
+                scoring_method = "ml_model"
+                logger.debug(f"🤖 ML scores for {symbol}: Long={ml_long:.1f}, Short={ml_short:.1f}, Conf={ml_confidence:.2f}")
+            else:
+                # Enhanced rule-based scoring (original logic improved)
+                # Volume + RSI combinations
+                if avg_volume_20 > 0 and current_candle_volume > (avg_volume_20 * VOLUME_SPIKE_FACTOR):
+                    if rsi_val < RSI_OVERSOLD + 5: 
+                        raw_long_score += 40
+                    if rsi_val > RSI_OVERBOUGHT - 5: 
+                        raw_short_score += 40
+
+                # Technical patterns
+                if support_bounce_condition:
+                    raw_long_score += 30
+                if resistance_rejection_condition:
+                    raw_short_score += 30
+
+                # Multi-timeframe alignment
+                if bullish_timeframes >= 2:
+                    raw_long_score += 25
+                if bearish_timeframes >= 2:
+                    raw_short_score += 25
+
+                # Failed breakouts
+                if failed_breakout_condition:
+                    raw_short_score += 20
+
+                # Additional volume patterns
+                if volume_spike and rsi_val < 30:
+                    raw_long_score += 15  # Volume spike at oversold
+                if volume_spike and rsi_val > 70:
+                    raw_short_score += 15  # Volume spike at overbought
+
+                scoring_method = "rule_based_enhanced"
+
+            # Correlation penalty
+            btc_corr, eth_corr, correlation_penalty = self.scoring_engine.calculate_correlation_penalty(symbol, returns_vec)
+            
+            # Market regime adjustment
+            regime_info = self.regime_detector.detect_regime()
+            regime_multiplier = 1.0
+            
+            if regime_info['regime'] == 'BEAR' and regime_info['confidence'] > 0.7:
+                regime_multiplier = REGIME_MULTIPLIER_BEAR
+                raw_long_score *= regime_multiplier  # Reduce long bias in bear market
+            elif regime_info['regime'] == 'BULL' and regime_info['confidence'] > 0.7:
+                regime_multiplier = REGIME_MULTIPLIER_BULL
+                raw_short_score *= regime_multiplier  # Reduce short bias in bull market
+
+            # Apply correlation penalty
+            final_long_score = max(0, raw_long_score - (raw_long_score * correlation_penalty))
+            final_short_score = max(0, raw_short_score - (raw_short_score * correlation_penalty))
+
+            # Binary decisions
+            simple_long_action_val = "BUY_LONG" if final_long_score >= BUY_THRESHOLD else "DON'T_BUY_LONG"
+            simple_short_action_val = "SHORT" if final_short_score >= BUY_THRESHOLD else "DON'T_SHORT"
+
+            # Determine primary direction
+            if final_long_score > final_short_score and final_long_score >= BUY_THRESHOLD:
+                direction = "LONG"
+                entry_recommendation = "BUY_LONG"
+            elif final_short_score > final_long_score and final_short_score >= BUY_THRESHOLD:
+                direction = "SHORT"
+                entry_recommendation = "SHORT"
+            else:
+                direction = "NEUTRAL"
+                entry_recommendation = "WAIT"
+
+            # Volatility calculation
+            volatility = df['close'].pct_change().rolling(20).std().iloc[-1] * 100 if len(df) >= 20 else 0.0
+            
+            logger.info(f"📊 {symbol}: {scoring_method.upper()} | Raw: L={raw_long_score:.1f}/S={raw_short_score:.1f} | "
+                       f"Final: L={final_long_score:.1f}/S={final_short_score:.1f} | Corr={correlation_penalty:.2f} | "
+                       f"Action: {simple_long_action_val}/{simple_short_action_val}")
 
             return TokenOpportunity(
-                symbol=symbol, current_price=round(current_price, 4),
-                price_change_1h=round(price_1h, 2), price_change_4h=round(price_4h, 2), price_change_24h=round(price_24h, 2),
-                rsi=round(rsi_val, 2), volume_spike=current_volume_spike_flag, support_bounce=support_bounce_flag,
-                resistance_rejection=resistance_rejection_flag, multi_timeframe_alignment=(mta_bullish_flag or mta_bearish_flag),
-                composite_score=round(composite_score_val, 2), entry_recommendation=entry_recommendation_val,
-                volatility=round(volatility_val, 2), returns_vec=returns_vec_val,
-                long_score=round(long_score, 2), short_score=round(short_score, 2), direction=direction_val,
-                simple_long_action=simple_long_action_val, simple_short_action=simple_short_action_val
+                symbol=symbol,
+                current_price=current_price,
+                price_change_1h=price_1h,
+                price_change_4h=price_4h,
+                price_change_24h=price_24h,
+                rsi=rsi_val,
+                volume_spike=volume_spike,
+                support_bounce=support_bounce_condition,
+                resistance_rejection=resistance_rejection_condition,
+                multi_timeframe_alignment=multi_timeframe_alignment,
+                composite_score=max(final_long_score, final_short_score),
+                entry_recommendation=entry_recommendation,
+                volatility=volatility if not pd.isna(volatility) else 0.0,
+                returns_vec=returns_vec,
+                # Enhanced scoring fields
+                long_score=final_long_score,
+                short_score=final_short_score,
+                raw_long_score=raw_long_score,
+                raw_short_score=raw_short_score,
+                correlation_btc=btc_corr,
+                correlation_eth=eth_corr,
+                correlation_penalty=correlation_penalty,
+                regime_multiplier=regime_multiplier,
+                direction=direction,
+                simple_long_action=simple_long_action_val,
+                simple_short_action=simple_short_action_val,
+                feature_vector=features,
+                ml_confidence=ml_confidence,
+                scoring_method=scoring_method
             )
+
         except Exception as e:
-            logger.error(f"Error in analyze_token_async for {symbol}: {e}", exc_info=True)
-            return self._create_empty_opportunity(symbol)
+            logger.error(f"❌ Error analyzing {symbol}: {e}", exc_info=True)
+            return None
+
+    def add_percentile_ranking(self, opportunities: List[TokenOpportunity]) -> List[TokenOpportunity]:
+        """Add cross-sectional percentile ranking to adapt to regime drift"""
+        if not opportunities or not PERCENTILE_RANKING:
+            return opportunities
+        
+        try:
+            # Extract scores for ranking
+            long_scores = [opp.long_score for opp in opportunities if opp.long_score is not None]
+            short_scores = [opp.short_score for opp in opportunities if opp.short_score is not None]
+            
+            if not long_scores or not short_scores:
+                logger.warning("⚠️ No valid scores for percentile ranking")
+                return opportunities
+            
+            # Calculate percentiles
+            for opp in opportunities:
+                if opp.long_score is not None:
+                    opp.percentile_long = sum(1 for score in long_scores if score <= opp.long_score) / len(long_scores) * 100
+                if opp.short_score is not None:
+                    opp.percentile_short = sum(1 for score in short_scores if score <= opp.short_score) / len(short_scores) * 100
+            
+            # Log percentile distribution
+            long_percentiles = [opp.percentile_long for opp in opportunities if opp.percentile_long is not None]
+            short_percentiles = [opp.percentile_short for opp in opportunities if opp.percentile_short is not None]
+            
+            logger.info(f"📊 Percentile Distribution - Long: {np.mean(long_percentiles):.1f}±{np.std(long_percentiles):.1f}, "
+                       f"Short: {np.mean(short_percentiles):.1f}±{np.std(short_percentiles):.1f}")
+            
+            return opportunities
+            
+        except Exception as e:
+            logger.error(f"❌ Error in percentile ranking: {e}")
+            return opportunities
 
     def save_analysis_results(self, opportunities: List[TokenOpportunity], market_regime_info: Optional[Dict] = None, perf_metrics: Optional[Dict] = None):
         results_metadata = {
@@ -419,15 +826,86 @@ class EnhancedTokenAnalyzer:
                     "resistance_rejection": opp.resistance_rejection, "multi_timeframe_alignment": opp.multi_timeframe_alignment
                 },
                 "simple_long_action": opp.simple_long_action, "simple_short_action": opp.simple_short_action,
-                "volatility": opp.volatility
+                "volatility": opp.volatility,
+                # ML prediction fields
+                "ml_probability": getattr(opp, 'ml_probability', None),
+                "ml_signal": getattr(opp, 'ml_signal', None), 
+                "ml_confidence": getattr(opp, 'ml_confidence', None),
+                "confidence_boost": getattr(opp, 'confidence_boost', 0.0)
             })
         try:
-            with open(OUTPUT_FILE, 'w') as f: json.dump(output_data, f, indent=2)
+            with open(OUTPUT_FILE, 'w') as f: json.dump(output_data, f, indent=2, cls=CustomJSONEncoder)
             logger.info(f"Analysis results saved to {OUTPUT_FILE}")
-            with open(DEBUG_FILE, 'w') as f: json.dump(output_data, f, indent=2) 
+            with open(DEBUG_FILE, 'w') as f: json.dump(output_data, f, indent=2, cls=CustomJSONEncoder) 
             logger.info(f"Debug analysis results saved to {DEBUG_FILE}")
         except Exception as e:
             logger.error(f"Error saving analysis results: {e}", exc_info=True)
+
+    def _check_support_bounce(self, df: pd.DataFrame, current_price: float) -> bool:
+        """Check if current price is bouncing from support level"""
+        try:
+            if len(df) < 50:
+                return False
+            
+            support_levels = self.detect_support_levels(df)
+            if not support_levels:
+                return False
+            
+            nearest_support = min(support_levels, key=lambda x: abs(x - current_price))
+            distance_pct = abs(current_price - nearest_support) / current_price
+            
+            return distance_pct < 0.01 and current_price > nearest_support
+        except:
+            return False
+
+    def _check_resistance_rejection(self, df: pd.DataFrame, current_price: float) -> bool:
+        """Check if current price is rejecting from resistance level"""
+        try:
+            if len(df) < 50:
+                return False
+            
+            resistance_levels = self.detect_resistance_levels(df)
+            if not resistance_levels:
+                return False
+            
+            nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
+            distance_pct = abs(current_price - nearest_resistance) / current_price
+            
+            return distance_pct < 0.01 and current_price < nearest_resistance
+        except:
+            return False
+
+    def _check_multi_timeframe_alignment(self, df: pd.DataFrame, current_price: float) -> bool:
+        """Check if multiple timeframes are aligned"""
+        try:
+            if len(df) < 1440:
+                return False
+            
+            price_1h = ((current_price - df["close"].iloc[-60]) / df["close"].iloc[-60] * 100) if len(df) >= 61 else 0.0
+            price_4h = ((current_price - df["close"].iloc[-240]) / df["close"].iloc[-240] * 100) if len(df) >= 241 else 0.0  
+            price_24h = ((current_price - df["close"].iloc[-1440]) / df["close"].iloc[-1440] * 100) if len(df) >= 1441 else 0.0
+            
+            bullish_count = sum([price_1h > 0, price_4h > 0, price_24h > -2])
+            bearish_count = sum([price_1h < 0, price_4h < 0, price_24h < 2])
+            
+            return bullish_count >= 2 or bearish_count >= 2
+        except:
+            return False
+
+    def _check_failed_breakout(self, df: pd.DataFrame, current_price: float) -> bool:
+        """Check if there's a failed breakout pattern"""
+        try:
+            if len(df) < 50:
+                return False
+            
+            rolling_high_window = min(20, len(df) - 1)
+            high_20 = df["high"].rolling(rolling_high_window).max().iloc[-rolling_high_window]
+            
+            recent_high = df["high"].tail(5).max()
+            
+            return recent_high > high_20 * 0.995 and current_price < high_20
+        except:
+            return False
 
 async def main():
     start_time_main = time.time()
@@ -451,29 +929,37 @@ async def main():
             return
 
         analysis_compute_start = time.time()
-        tasks = [analyzer.analyze_token_async(session, symbol) for symbol in symbols_to_analyze]
+        tasks = [analyzer.analyze_token_async(symbol, session) for symbol in symbols_to_analyze]
         analysis_results = await asyncio.gather(*tasks, return_exceptions=True)
         analysis_compute_duration = (time.time() - analysis_compute_start) * 1000
         
-        opportunities_list: List[TokenOpportunity] = []
-        for i, res in enumerate(analysis_results):
-            symbol_for_log = symbols_to_analyze[i] if i < len(symbols_to_analyze) else "UNKNOWN_SYMBOL_INDEX_ERROR"
-            if isinstance(res, TokenOpportunity):
-                opportunities_list.append(res)
-            elif isinstance(res, Exception):
-                logger.error(f"Exception during analysis for symbol {symbol_for_log}: {res}", exc_info=True)
-                opportunities_list.append(analyzer._create_empty_opportunity(symbol_for_log)) 
-            else:
-                 logger.warning(f"Unexpected result type from analyze_token_async for {symbol_for_log}: {type(res)}")
-                 opportunities_list.append(analyzer._create_empty_opportunity(symbol_for_log))
-
-
-        opportunities_list.sort(key=lambda x: x.composite_score, reverse=True)
+        # Filter valid results and handle exceptions
+        valid_opportunities = []
+        for i, result in enumerate(analysis_results):
+            if isinstance(result, Exception):
+                logger.error(f"❌ Analysis failed for {symbols_to_analyze[i]}: {result}")
+            elif result is not None:
+                valid_opportunities.append(result)
+        
+        # Apply cross-sectional percentile ranking 
+        if valid_opportunities:
+            valid_opportunities = analyzer.add_percentile_ranking(valid_opportunities)
+        
+        # Integrate optimized ML predictions
+        if valid_opportunities:
+            valid_opportunities = integrate_optimized_ml_predictions(valid_opportunities)
+        
+        # Detect market regime
+        regime_detect_start = time.time()
+        market_regime_info = analyzer.regime_detector.detect_regime()
+        regime_detect_duration = (time.time() - regime_detect_start) * 1000
+        
+        valid_opportunities.sort(key=lambda x: x.composite_score, reverse=True)
     
     total_elapsed_main = (time.time() - start_time_main) * 1000
     
     successfully_processed_count = len([
-        opp for opp in opportunities_list 
+        opp for opp in valid_opportunities 
         if opp.entry_recommendation != "INSUFFICIENT_DATA"
     ])
 
@@ -485,17 +971,68 @@ async def main():
         "tokens_successfully_processed": successfully_processed_count
     }
     
-    analyzer.save_analysis_results(opportunities_list, market_regime_info, perf_metrics=performance_metrics)
+    analyzer.save_analysis_results(valid_opportunities, market_regime_info, perf_metrics=performance_metrics)
     
-    logger.info(f"Enhanced analysis complete: {len(opportunities_list)} tokens results generated in {total_elapsed_main:.0f}ms ({successfully_processed_count} successfully processed). Output: {OUTPUT_FILE}")
-    if opportunities_list and successfully_processed_count > 0 :
-        top_real_opp = next((opp for opp in opportunities_list if opp.entry_recommendation != "INSUFFICIENT_DATA"), None)
+    logger.info(f"Enhanced analysis complete: {len(valid_opportunities)} tokens results generated in {total_elapsed_main:.0f}ms ({successfully_processed_count} successfully processed). Output: {OUTPUT_FILE}")
+    if valid_opportunities and successfully_processed_count > 0 :
+        top_real_opp = next((opp for opp in valid_opportunities if opp.entry_recommendation != "INSUFFICIENT_DATA"), None)
         if top_real_opp:
              logger.info(f"Top scorable opportunity: {top_real_opp.symbol} (L: {top_real_opp.long_score}, S: {top_real_opp.short_score}, Rec: {top_real_opp.entry_recommendation})")
         else:
             logger.info("No scorable opportunities found despite processing.")
     else:
         logger.info("No scorable opportunities found or processed.")
+
+def integrate_optimized_ml_predictions(opportunities: List[TokenOpportunity]) -> List[TokenOpportunity]:
+    """Integrate optimized ML predictions using the new LightGBM pipeline"""
+    try:
+        from ml_inference_engine import MLInferenceEngine
+        
+        logger.info("🧠 Integrating optimized ML predictions...")
+        ml_engine = MLInferenceEngine(models_dir="models")
+        
+        if not ml_engine.load_latest_model():
+            logger.warning("⚠️ Optimized ML model not available, using existing predictions")
+            return opportunities
+        
+        # Get symbols to predict
+        symbols = [opp.symbol for opp in opportunities]
+        ml_predictions = ml_engine.batch_predict(symbols)
+        
+        # Enhance opportunities with ML predictions
+        for opp in opportunities:
+            if opp.symbol in ml_predictions:
+                ml_pred = ml_predictions[opp.symbol]['ml_prediction']
+                
+                # Update scores with ML predictions
+                opp.ml_probability = ml_pred['probability']
+                opp.ml_confidence = ml_pred['confidence']
+                opp.ml_signal = ml_pred['signal']
+                
+                # If ML confidence is high, boost the score
+                if ml_pred['confidence'] > 0.7:
+                    if ml_pred['signal'] == 'BUY_LONG' and opp.simple_long_action == 'BUY_LONG':
+                        opp.long_score = min(100, opp.long_score * 1.15)  # 15% boost for high-confidence ML agreement
+                        opp.confidence_boost = True
+                    elif ml_pred['signal'] == 'SHORT' and opp.simple_short_action == 'SHORT':
+                        opp.short_score = min(100, opp.short_score * 1.15)  # 15% boost for high-confidence ML agreement
+                        opp.confidence_boost = True
+                    elif ml_pred['signal'] == 'NEUTRAL':
+                        opp.long_score = max(0, opp.long_score * 0.9)  # Reduce score if ML disagrees
+                        opp.short_score = max(0, opp.short_score * 0.9)  # Reduce score if ML disagrees
+                        opp.confidence_boost = False
+        
+        enhanced_count = len([opp for opp in opportunities if hasattr(opp, 'ml_probability')])
+        logger.info(f"✅ Enhanced {enhanced_count}/{len(opportunities)} opportunities with optimized ML")
+        
+        return opportunities
+        
+    except ImportError:
+        logger.warning("⚠️ ML inference engine not available")
+        return opportunities
+    except Exception as e:
+        logger.error(f"❌ ML integration failed: {e}")
+        return opportunities
 
 if __name__ == "__main__":
     asyncio.run(main())
