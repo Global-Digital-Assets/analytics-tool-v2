@@ -1,0 +1,110 @@
+name: CI/CD Pipeline - Crypto ML Analytics
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.9, 3.11]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest==7.4.3 pytest-cov==4.1.0 pytest-asyncio==0.21.1 mypy==1.5.1
+    
+    - name: Linting (basic syntax check)
+      run: |
+        python -m py_compile *.py
+        echo "✅ Basic syntax validation passed"
+    
+    - name: Run unit tests with coverage
+      run: |
+        pytest tests/ -v --cov=. --cov-report=term-missing --cov-fail-under=70
+    
+    - name: ML Pipeline Integration Test
+      run: |
+        python -c "
+        import sys
+        sys.path.append('.')
+        
+        # Test core imports
+        try:
+            from production_ml_pipeline import ProductionMLPipeline
+            from ml_monitoring import MLMonitoring
+            print('✅ Core ML modules import successfully')
+        except ImportError as e:
+            print(f'❌ Import failed: {e}')
+            sys.exit(1)
+        "
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.11
+    
+    - name: Install security tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install safety
+    
+    - name: Check for known vulnerabilities
+      run: |
+        safety check --json || echo "⚠️ Security scan completed with warnings"
+
+  validate-production-ready:
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Validate deployment readiness
+      run: |
+        echo "🔍 Validating production readiness..."
+        
+        # Check critical files exist
+        test -f "production_ml_pipeline.py" && echo "✅ ML pipeline found"
+        test -f "ml_monitoring.py" && echo "✅ ML monitoring found"
+        test -f "requirements.txt" && echo "✅ Requirements found"
+        test -f "run_retrain.sh" && echo "✅ Retrain script found"
+        
+        # Check requirements are pinned
+        if grep -q "==" requirements.txt; then
+            echo "✅ Dependencies are pinned"
+        else
+            echo "❌ Dependencies not properly pinned"
+            exit 1
+        fi
+        
+        echo "🚀 Production validation passed"

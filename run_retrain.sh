@@ -4,7 +4,9 @@
 Smart retrain routing with enhanced logging
 """
 
-set -e  # Exit on any error
+# Enhanced Retrain Script with Bash Safety
+# Added safety flags for production reliability
+set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
 # Configuration
 ANALYTICS_DIR="/root/analytics-tool-v2"
