@@ -144,3 +144,4 @@ ehthumbs.db
 Thumbs.db
 *.db
 backup_*/market_data.db
+market_data.db
