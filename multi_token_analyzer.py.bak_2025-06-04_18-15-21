@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""
+Enhanced Multi-Token Analytics Engine
+Institutional-grade signal generator with async processing and rich metadata
+"""
+import asyncio
+import aiohttp
+import sqlite3
+import json
+import time
+import logging
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Any
+import numpy as np
+from config import *
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class TokenOpportunity:
+    """Enhanced token opportunity data structure"""
+    symbol: str
+    composite_score: float
+    entry_recommendation: str
+    current_price: float
+    rsi: float
+    volume_spike: float
+    price_change_24h: float
+    correlation_to_btc: float
+    technical_signal: str
+    risk_level: str
+    timestamp: str
+    data_freshness_ms: int
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+class MarketRegimeDetector:
+    """Detect overall market regime based on BTC analysis"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+    
+    def detect_regime(self) -> Dict[str, Any]:
+        """Analyze BTC to determine market regime"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get recent BTC data for SMA calculation
+            cursor.execute('''
+                SELECT close, timestamp FROM candles 
+                WHERE symbol = 'BTCUSDT' 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (SMA_LONG_PERIOD,))
+            
+            rows = cursor.fetchall()
+            conn.close()
+            
+            if len(rows) < SMA_LONG_PERIOD:
+                return {"regime": "insufficient_data", "confidence": 0.0}
+            
+            prices = [float(row[0]) for row in rows]
+            
+            # Calculate SMAs
+            sma20 = np.mean(prices[:SMA_SHORT_PERIOD])
+            sma50 = np.mean(prices[:SMA_LONG_PERIOD])
+            
+            regime = "trending_bull" if sma20 > sma50 else "trending_bear"
+            confidence = abs(sma20 - sma50) / sma50 * 100
+            
+            return {
+                "regime": regime,
+                "confidence": min(confidence, 100.0),
+                "btc_sma20": sma20,
+                "btc_sma50": sma50
+            }
+            
+        except Exception as e:
+            logger.error(f"Error detecting market regime: {e}")
+            return {"regime": "error", "confidence": 0.0}
+
+class EnhancedTokenAnalyzer:
+    """Enhanced token analyzer with async processing"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.regime_detector = MarketRegimeDetector(db_path)
+        
+    async def validate_symbols(self, session: aiohttp.ClientSession) -> List[str]:
+        """Dynamic symbol validation against Binance API"""
+        try:
+            async with session.get(
+                f'{BINANCE_BASE_URL}/api/v3/exchangeInfo',
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    valid_symbols = {
+                        s['symbol'] for s in data['symbols'] 
+                        if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')
+                    }
+                    validated = [token for token in BASE_TOKENS if token in valid_symbols]
+                    logger.info(f"Validated {len(validated)}/{len(BASE_TOKENS)} symbols")
+                    return validated
+                else:
+                    logger.warning(f"Exchange info API returned {resp.status}")
+                    return BASE_TOKENS
+        except Exception as e:
+            logger.warning(f"Symbol validation failed: {e}, using base list")
+            return BASE_TOKENS
+    
+    def get_token_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get latest token data from local database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get latest candle
+            cursor.execute('''
+                SELECT timestamp, open, high, low, close, volume
+                FROM candles 
+                WHERE symbol = ? 
+                ORDER BY timestamp DESC 
+                LIMIT 1
+            ''', (symbol,))
+            
+            latest = cursor.fetchone()
+            if not latest:
+                return None
+            
+            timestamp, open_price, high, low, close, volume = latest
+            current_time = int(time.time() * 1000)
+            data_age = current_time - timestamp
+            
+            # Get historical data for calculations
+            cursor.execute('''
+                SELECT close, volume, timestamp FROM candles 
+                WHERE symbol = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (symbol, max(RSI_PERIOD + 1, CORRELATION_WINDOW)))
+            
+            historical = cursor.fetchall()
+            conn.close()
+            
+            if len(historical) < RSI_PERIOD:
+                return None
+                
+            return {
+                'symbol': symbol,
+                'current_price': float(close),
+                'volume': float(volume),
+                'data_age_ms': data_age,
+                'historical_prices': [float(row[0]) for row in historical],
+                'historical_volumes': [float(row[1]) for row in historical],
+                'timestamp': timestamp
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting data for {symbol}: {e}")
+            return None
+    
+    def calculate_rsi(self, prices: List[float], period: int = RSI_PERIOD) -> float:
+        """Calculate RSI indicator"""
+        if len(prices) < period + 1:
+            return 50.0  # Neutral RSI
+            
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains[:period])
+        avg_loss = np.mean(losses[:period])
+        
+        if avg_loss == 0:
+            return 100.0
+            
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi)
+    
+    def calculate_volume_spike(self, volumes: List[float]) -> float:
+        """Calculate volume spike ratio"""
+        if len(volumes) < 2:
+            return 1.0
+            
+        current_volume = volumes[0]
+        avg_volume = np.mean(volumes[1:min(21, len(volumes))])  # 20-period average
+        
+        if avg_volume == 0:
+            return 1.0
+            
+        return current_volume / avg_volume
+    
+    def calculate_correlation_to_btc(self, symbol: str, prices: List[float]) -> float:
+        """Calculate correlation to BTC"""
+        if symbol == 'BTCUSDT':
+            return 1.0
+            
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get BTC prices for same period
+            cursor.execute('''
+                SELECT close FROM candles 
+                WHERE symbol = 'BTCUSDT' 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (len(prices),))
+            
+            btc_prices = [float(row[0]) for row in cursor.fetchall()]
+            conn.close()
+            
+            if len(btc_prices) != len(prices) or len(prices) < 10:
+                return 0.5  # Default correlation
+                
+            correlation = np.corrcoef(prices, btc_prices)[0, 1]
+            return float(correlation) if not np.isnan(correlation) else 0.5
+            
+        except Exception as e:
+            logger.warning(f"Correlation calculation failed for {symbol}: {e}")
+            return 0.5
+    
+    async def analyze_token_async(self, session: aiohttp.ClientSession, symbol: str, market_regime: Dict[str, Any]) -> TokenOpportunity:
+        """Async token analysis with error handling"""
+        try:
+            data = self.get_token_data(symbol)
+            if not data:
+                return self._create_error_opportunity(symbol, "No data available")
+            
+            # Check data freshness
+            if data['data_age_ms'] > MAX_DATA_AGE_MS:
+                logger.warning(f"{symbol}: Data is {data['data_age_ms']/1000:.1f}s old")
+            
+            # Calculate indicators
+            rsi = self.calculate_rsi(data['historical_prices'])
+            volume_spike = self.calculate_volume_spike(data['historical_volumes'])
+            correlation = self.calculate_correlation_to_btc(symbol, data['historical_prices'])
+            
+            # Calculate 24h price change
+            if len(data['historical_prices']) >= 1440:  # 24 hours of 1min candles
+                price_24h_ago = data['historical_prices'][1439]
+                price_change_24h = ((data['current_price'] - price_24h_ago) / price_24h_ago) * 100
+            else:
+                # Use available data
+                oldest_price = data['historical_prices'][-1]
+                price_change_24h = ((data['current_price'] - oldest_price) / oldest_price) * 100
+            
+            # Generate technical signal
+            technical_signal = self._generate_technical_signal(rsi, volume_spike, price_change_24h)
+            
+            # Calculate composite score (market regime adjusted)
+            base_score = self._calculate_composite_score(rsi, volume_spike, price_change_24h, correlation)
+            regime_multiplier = 1.2 if market_regime.get('regime') == 'trending_bull' else 0.8
+            composite_score = base_score * regime_multiplier
+            
+            # Generate entry recommendation
+            entry_recommendation = self._generate_entry_recommendation(composite_score, rsi, technical_signal)
+            
+            # Assess risk level
+            risk_level = self._assess_risk_level(rsi, volume_spike, correlation)
+            
+            return TokenOpportunity(
+                symbol=symbol,
+                composite_score=round(composite_score, 2),
+                entry_recommendation=entry_recommendation,
+                current_price=data['current_price'],
+                rsi=round(rsi, 2),
+                volume_spike=round(volume_spike, 2),
+                price_change_24h=round(price_change_24h, 2),
+                correlation_to_btc=round(correlation, 3),
+                technical_signal=technical_signal,
+                risk_level=risk_level,
+                timestamp=datetime.fromtimestamp(data['timestamp']/1000).isoformat(),
+                data_freshness_ms=data['data_age_ms']
+            )
+            
+        except Exception as e:
+            logger.warning(f"Failed to analyze {symbol}: {e}")
+            return self._create_error_opportunity(symbol, str(e))
+    
+    def _create_error_opportunity(self, symbol: str, error_msg: str) -> TokenOpportunity:
+        """Create error opportunity object"""
+        return TokenOpportunity(
+            symbol=symbol,
+            composite_score=0.0,
+            entry_recommendation="ERROR",
+            current_price=0.0,
+            rsi=50.0,
+            volume_spike=1.0,
+            price_change_24h=0.0,
+            correlation_to_btc=0.5,
+            technical_signal="ERROR",
+            risk_level="HIGH",
+            timestamp=datetime.now().isoformat(),
+            data_freshness_ms=999999
+        )
+    
+    def _generate_technical_signal(self, rsi: float, volume_spike: float, price_change: float) -> str:
+        """Generate technical trading signal"""
+        if rsi < RSI_OVERSOLD and volume_spike > VOLUME_SPIKE_THRESHOLD:
+            return "STRONG_BUY"
+        elif rsi < RSI_OVERSOLD:
+            return "BUY"
+        elif rsi > RSI_OVERBOUGHT and volume_spike > VOLUME_SPIKE_THRESHOLD:
+            return "STRONG_SELL"
+        elif rsi > RSI_OVERBOUGHT:
+            return "SELL"
+        elif volume_spike > VOLUME_SPIKE_THRESHOLD and price_change > 0:
+            return "MOMENTUM_BUY"
+        elif volume_spike > VOLUME_SPIKE_THRESHOLD and price_change < 0:
+            return "MOMENTUM_SELL"
+        else:
+            return "HOLD"
+    
+    def _calculate_composite_score(self, rsi: float, volume_spike: float, price_change: float, correlation: float) -> float:
+        """Calculate composite opportunity score"""
+        # RSI component (higher score for oversold)
+        rsi_score = (100 - rsi) / 100 * 30
+        
+        # Volume component
+        volume_score = min(volume_spike / VOLUME_SPIKE_THRESHOLD, 3.0) * 25
+        
+        # Price momentum component
+        momentum_score = max(min(price_change / 5, 3.0), -3.0) * 15
+        
+        # Correlation component (lower correlation = higher score for diversification)
+        correlation_score = (1 - abs(correlation)) * 30
+        
+        return max(0, rsi_score + volume_score + momentum_score + correlation_score)
+    
+    def _generate_entry_recommendation(self, score: float, rsi: float, signal: str) -> str:
+        """Generate entry recommendation based on score and signals"""
+        if signal in ["STRONG_BUY", "MOMENTUM_BUY"] and score > 70:
+            return "STRONG_BUY"
+        elif signal in ["BUY", "MOMENTUM_BUY"] and score > 50:
+            return "BUY"
+        elif signal in ["STRONG_SELL", "MOMENTUM_SELL"] and score < 30:
+            return "STRONG_SELL"
+        elif signal in ["SELL", "MOMENTUM_SELL"] and score < 50:
+            return "SELL"
+        else:
+            return "HOLD"
+    
+    def _assess_risk_level(self, rsi: float, volume_spike: float, correlation: float) -> str:
+        """Assess risk level for the opportunity"""
+        risk_factors = 0
+        
+        if rsi > 80 or rsi < 20:
+            risk_factors += 1
+        if volume_spike > 5.0:
+            risk_factors += 1
+        if abs(correlation) > 0.9:
+            risk_factors += 1
+            
+        if risk_factors >= 2:
+            return "HIGH"
+        elif risk_factors == 1:
+            return "MEDIUM"
+        else:
+            return "LOW"
+
+async def main():
+    """Main async analysis function"""
+    start_time = time.time()
+    logger.info("Starting enhanced multi-token analysis...")
+    
+    # Initialize analyzer
+    db_path = '/root/analytics-tool-v2/market_data.db'
+    analyzer = EnhancedTokenAnalyzer(db_path)
+    
+    # Detect market regime
+    market_regime = analyzer.regime_detector.detect_regime()
+    logger.info(f"Market regime: {market_regime.get('regime', 'unknown')}")
+    
+    async with aiohttp.ClientSession() as session:
+        # Dynamic symbol validation
+        api_start = time.time()
+        valid_symbols = await analyzer.validate_symbols(session)
+        api_duration = (time.time() - api_start) * 1000
+        
+        # Parallel token analysis
+        compute_start = time.time()
+        tasks = [analyzer.analyze_token_async(session, symbol, market_regime) for symbol in valid_symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        compute_duration = (time.time() - compute_start) * 1000
+        
+        # Filter out exceptions and sort by score
+        opportunities = []
+        for result in results:
+            if isinstance(result, TokenOpportunity):
+                opportunities.append(result)
+            else:
+                logger.error(f"Analysis failed: {result}")
+        
+        opportunities.sort(key=lambda x: x.composite_score, reverse=True)
+    
+    total_duration = (time.time() - start_time) * 1000
+    
+    # Calculate data freshness
+    avg_freshness = np.mean([opp.data_freshness_ms for opp in opportunities]) if opportunities else 0
+    
+    # Generate output with rich metadata
+    output = {
+        "metadata": {
+            "analysis_timestamp": datetime.now().isoformat(),
+            "market_regime": market_regime.get('regime', 'unknown'),
+            "regime_confidence": market_regime.get('confidence', 0.0),
+            "data_freshness_ms": int(avg_freshness),
+            "performance_metrics": {
+                "api_fetch_ms": int(api_duration),
+                "analysis_compute_ms": int(compute_duration),
+                "total_elapsed_ms": int(total_duration)
+            },
+            "tokens_analyzed": len(opportunities),
+            "tokens_requested": len(valid_symbols),
+            "version": "2.0_enhanced"
+        },
+        "opportunities": [opp.to_dict() for opp in opportunities]
+    }
+    
+    # Save to file
+    with open(OUTPUT_FILE, 'w') as f:
+        json.dump(output, f, indent=2)
+    
+    logger.info(f"Analysis complete: {len(opportunities)} tokens analyzed in {total_duration:.0f}ms")
+    logger.info(f"Top opportunity: {opportunities[0].symbol if opportunities else 'None'}")
+    logger.info(f"Output saved to: {OUTPUT_FILE}")
+    
+    return output
+
+if __name__ == "__main__":
+    asyncio.run(main())

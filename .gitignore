@@ -142,3 +142,5 @@ analytics/reports/
 .Trashes
 ehthumbs.db
 Thumbs.db
+*.db
+backup_*/market_data.db

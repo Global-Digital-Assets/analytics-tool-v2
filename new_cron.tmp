@@ -1,0 +1,16 @@
+# Existing analytics tool
+*/15 * * * * cd /root/analytics-tool-v2 && source venv/bin/activate && python3 multi_token_analyzer.py >> /root/analytics-tool-v2/analyzer.log 2>&1
+
+# ML Model Monitoring (every 4 hours)
+0 */4 * * * cd /root/analytics-tool-v2 && /root/analytics-tool-v2/venv/bin/python ml_monitoring.py --action monitor >> logs/ml_monitor.log 2>&1
+
+# Weekly full retrain (Sunday 2 AM)
+# OLD WEEKLY: 0 2 * * 0 cd /root/analytics-tool-v2 && /root/analytics-tool-v2/venv/bin/python production_ml_pipeline.py --days 180 >> logs/weekly_retrain.log 2>&1
+
+# Performance evaluation (daily at 6 AM)
+0 6 * * * cd /root/analytics-tool-v2 && /root/analytics-tool-v2/venv/bin/python ml_monitoring.py --action evaluate --days 7 >> logs/daily_eval.log 2>&1
+
+# Log cleanup (keep last 30 days, runs weekly)
+0 3 * * 1 find /root/analytics-tool-v2/logs -name "*.log" -mtime +30 -delete
+# Monthly full retrain (1st Sunday at 2 AM, 365-day window)
+0 2 1 * * cd /root/analytics-tool-v2 \&\& ./run_retrain.sh --mode full --days 365 --tag monthly >> logs/monthly_retrain.log 2>\&1

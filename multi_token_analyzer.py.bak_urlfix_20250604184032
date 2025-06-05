@@ -1,0 +1,475 @@
+import asyncio
+import json
+import logging
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+import os
+import pandas as pd
+import numpy as np
+import aiohttp
+
+# --- Configuration ---
+# Attempt to import from config.py, with fallbacks if not found or incomplete
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_PATH_DEFAULT = os.path.join(SCRIPT_DIR, 'market_data.db')
+OUTPUT_FILE_DEFAULT = os.path.join(SCRIPT_DIR, 'multi_token_analysis.json')
+DEBUG_FILE_DEFAULT = os.path.join(SCRIPT_DIR, 'analyzer_debug.json')
+LOG_FILE_DEFAULT = os.path.join(SCRIPT_DIR, 'analyzer.log')
+
+try:
+    from config import (
+        RSI_PERIOD as CFG_RSI_PERIOD,
+        RSI_OVERSOLD as CFG_RSI_OVERSOLD,
+        RSI_OVERBOUGHT as CFG_RSI_OVERBOUGHT,
+        VOLUME_SPIKE_FACTOR as CFG_VOLUME_SPIKE_FACTOR,
+        TOKEN_LIST_URL as CFG_TOKEN_LIST_URL,
+        DEFAULT_TOKENS as CFG_DEFAULT_TOKENS,
+        ANALYSIS_CANDLE_LIMIT as CFG_ANALYSIS_CANDLE_LIMIT,
+        API_TIMEOUT as CFG_API_TIMEOUT,
+        DB_PATH_OVERRIDE as CFG_DB_PATH_OVERRIDE,
+        LOG_LEVEL as CFG_LOG_LEVEL,
+        OUTPUT_FILE_OVERRIDE as CFG_OUTPUT_FILE_OVERRIDE,
+        DEBUG_FILE_OVERRIDE as CFG_DEBUG_FILE_OVERRIDE,
+        LOG_FILE_OVERRIDE as CFG_LOG_FILE_OVERRIDE
+    )
+    RSI_PERIOD = CFG_RSI_PERIOD
+    RSI_OVERSOLD = CFG_RSI_OVERSOLD
+    RSI_OVERBOUGHT = CFG_RSI_OVERBOUGHT
+    VOLUME_SPIKE_FACTOR = CFG_VOLUME_SPIKE_FACTOR
+    TOKEN_LIST_URL = CFG_TOKEN_LIST_URL
+    DEFAULT_TOKENS = CFG_DEFAULT_TOKENS
+    ANALYSIS_CANDLE_LIMIT = CFG_ANALYSIS_CANDLE_LIMIT
+    API_TIMEOUT = CFG_API_TIMEOUT
+    DB_PATH = CFG_DB_PATH_OVERRIDE if CFG_DB_PATH_OVERRIDE else DB_PATH_DEFAULT
+    LOG_LEVEL = CFG_LOG_LEVEL
+    OUTPUT_FILE = CFG_OUTPUT_FILE_OVERRIDE if CFG_OUTPUT_FILE_OVERRIDE else OUTPUT_FILE_DEFAULT
+    DEBUG_FILE = CFG_DEBUG_FILE_OVERRIDE if CFG_DEBUG_FILE_OVERRIDE else DEBUG_FILE_DEFAULT
+    LOG_FILE = CFG_LOG_FILE_OVERRIDE if CFG_LOG_FILE_OVERRIDE else LOG_FILE_DEFAULT
+
+except ImportError:
+    RSI_PERIOD = 14
+    RSI_OVERSOLD = 30
+    RSI_OVERBOUGHT = 70
+    VOLUME_SPIKE_FACTOR = 2.0
+    TOKEN_LIST_URL = "https://api.binance.com/api/v3/exchangeInfo"
+    DEFAULT_TOKENS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+    ANALYSIS_CANDLE_LIMIT = 1500
+    API_TIMEOUT = 10
+    DB_PATH = DB_PATH_DEFAULT
+    LOG_LEVEL = "INFO"
+    OUTPUT_FILE = OUTPUT_FILE_DEFAULT
+    DEBUG_FILE = DEBUG_FILE_DEFAULT
+    LOG_FILE = LOG_FILE_DEFAULT
+
+# --- Logging Setup ---
+log_dir = os.path.dirname(LOG_FILE)
+if log_dir and not os.path.exists(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format='%(asctime)s - %(levelname)s - %(module)s - %(funcName)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode='a'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# --- Data Structures ---
+@dataclass
+class TokenOpportunity:
+    symbol: str
+    current_price: float = 0.0
+    price_change_1h: float = 0.0
+    price_change_4h: float = 0.0
+    price_change_24h: float = 0.0
+    rsi: float = 50.0
+    volume_spike: bool = False
+    support_bounce: bool = False
+    multi_timeframe_alignment: bool = False
+    composite_score: float = 0.0
+    entry_recommendation: str = "WAIT"
+    volatility: float = 0.0
+    returns_vec: List[float] = field(default_factory=list)
+    long_score: float = 0.0
+    short_score: float = 0.0
+    direction: str = "NEUTRAL"
+    resistance_rejection: bool = False
+
+# --- Regime Detection ---
+class RegimeDetector:
+    def __init__(self, db_path):
+        self.db_path = db_path
+
+    def _get_db_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def detect_regime(self, symbol="BTCUSDT", window=20):
+        try:
+            conn = self._get_db_connection()
+            two_days_ago_ms = (datetime.now() - timedelta(days=2)).timestamp() * 1000
+            query = f"""
+                SELECT close FROM candles
+                WHERE symbol = ? AND timestamp >= ?
+                ORDER BY timestamp DESC LIMIT ?
+            """
+            df = pd.read_sql_query(query, conn, params=(symbol, two_days_ago_ms, window + 5))
+            conn.close()
+
+            if len(df) < window:
+                return {"regime": "unknown", "confidence": 0.0, "details": "Insufficient BTC data for regime detection"}
+
+            df['close'] = pd.to_numeric(df['close'])
+            df = df.iloc[::-1].reset_index(drop=True)
+
+            df['sma'] = df['close'].rolling(window=window).mean()
+            current_price = df['close'].iloc[-1]
+            current_sma = df['sma'].iloc[-1]
+
+            if pd.isna(current_sma):
+                 return {"regime": "unknown", "confidence": 0.0, "details": "SMA calculation failed for regime"}
+
+            if current_price > current_sma * 1.01:
+                return {"regime": "trending_bull", "confidence": 0.7, "details": f"BTC > {window}-period SMA"}
+            elif current_price < current_sma * 0.99:
+                return {"regime": "trending_bear", "confidence": 0.7, "details": f"BTC < {window}-period SMA"}
+            else:
+                return {"regime": "ranging", "confidence": 0.5, "details": f"BTC near {window}-period SMA"}
+        except Exception as e:
+            logger.error(f"Error in regime detection: {e}", exc_info=True)
+            return {"regime": "error", "confidence": 0.0, "details": str(e)}
+
+# --- Main Analyzer Class ---
+class EnhancedTokenAnalyzer:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.regime_detector = RegimeDetector(db_path)
+        self.token_list = DEFAULT_TOKENS
+
+    def _get_db_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    async def _fetch_historical_data_from_db(self, symbol: str, limit: int = ANALYSIS_CANDLE_LIMIT) -> Optional[pd.DataFrame]:
+        try:
+            conn = self._get_db_connection()
+            two_days_ago_ms = (datetime.now() - timedelta(days=2)).timestamp() * 1000
+            query = f"""
+                SELECT timestamp, open, high, low, close, volume FROM candles
+                WHERE symbol = ? AND timestamp >= ?
+                ORDER BY timestamp DESC LIMIT ?
+            """
+            df = pd.read_sql_query(query, conn, params=(symbol, two_days_ago_ms, limit))
+            conn.close()
+
+            if df.empty:
+                logger.warning(f"No data found in DB for {symbol} within last 2 days.")
+                return None
+
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric)
+            df = df.iloc[::-1].reset_index(drop=True)
+            return df
+        except Exception as e:
+            logger.error(f"DB Error fetching {symbol}: {e}", exc_info=True)
+            return None
+
+    async def validate_symbols(self, session: aiohttp.ClientSession) -> List[str]:
+        try:
+            async with session.get(TOKEN_LIST_URL, timeout=API_TIMEOUT) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    valid_symbols_set = {s['symbol'] for s in data.get('symbols', []) if s['status'] == 'TRADING' and s['symbol'].endswith('USDT')}
+                    
+                    validated_list = [s for s in DEFAULT_TOKENS if s in valid_symbols_set]
+                    if not validated_list and DEFAULT_TOKENS: 
+                        logger.warning(f"None of the DEFAULT_TOKENS ({DEFAULT_TOKENS}) are currently valid trading USDT pairs. Check config.")
+                    
+                    logger.info(f"Validated {len(validated_list)} symbols from DEFAULT_TOKENS for analysis.")
+                    self.token_list = validated_list if validated_list else [] 
+                    return self.token_list
+                else:
+                    logger.warning(f"Failed to fetch exchange info (status {response.status}). Using configured DEFAULT_TOKENS: {DEFAULT_TOKENS}")
+        except Exception as e:
+            logger.error(f"Error validating symbols: {e}. Using configured DEFAULT_TOKENS: {DEFAULT_TOKENS}", exc_info=True)
+        self.token_list = DEFAULT_TOKENS 
+        return DEFAULT_TOKENS
+
+
+    def _calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> float:
+        if prices is None or len(prices) < period + 1: 
+            return 50.0
+        try:
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0.0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
+            
+            if loss.iloc[-1] == 0: 
+                return 100.0 if gain.iloc[-1] > 0 else 50.0
+
+            rs = gain.iloc[-1] / loss.iloc[-1]
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+            return rsi if not pd.isna(rsi) else 50.0
+        except Exception as e:
+            logger.error(f"Error calculating RSI: {e}", exc_info=True)
+            return 50.0
+
+
+    def detect_support_levels(self, df: pd.DataFrame) -> List[float]:
+        try:
+            if len(df) < 40: return []
+            lows = df["low"].values
+            support_levels = []
+            for i in range(5, len(lows) - 5):
+                if lows[i] == min(lows[i-5:i+6]):
+                    support_levels.append(float(lows[i]))
+            return sorted(list(set(support_levels)), reverse=False)[:3]
+        except Exception as e:
+            logger.error(f"Error detecting support levels: {e}", exc_info=True)
+            return []
+
+    def detect_resistance_levels(self, df: pd.DataFrame) -> List[float]:
+        try:
+            if len(df) < 40: return []
+            highs = df["high"].values
+            resistance_levels = []
+            for i in range(5, len(highs) - 5):
+                if highs[i] == max(highs[i-5:i+6]):
+                    resistance_levels.append(float(highs[i]))
+            return sorted(list(set(resistance_levels)), reverse=True)[:3]
+        except Exception as e:
+            logger.error(f"Error detecting resistance levels: {e}", exc_info=True)
+            return []
+
+    def calculate_volatility(self, prices: pd.Series) -> float:
+        try:
+            if prices is None or len(prices) < 21: return 0.0
+            returns = prices.pct_change().dropna()
+            if len(returns) < 20: return 0.0
+            volatility_val = returns.rolling(window=20).std().iloc[-1]
+            annualized_volatility = float(volatility_val * np.sqrt(365 * 24 * 60) * 100)
+            return annualized_volatility if not np.isnan(annualized_volatility) else 0.0
+        except Exception as e:
+            logger.error(f"Error calculating volatility: {e}", exc_info=True)
+            return 0.0
+
+    def calculate_returns_vector(self, prices: pd.Series) -> List[float]:
+        try:
+            if prices is None or len(prices) < 11: return []
+            returns = prices.pct_change().dropna()
+            if len(returns) < 10: return []
+            recent_returns = returns.tail(10).tolist()
+            return [float(r) for r in recent_returns if not np.isnan(r)]
+        except Exception as e:
+            logger.error(f"Error calculating returns vector: {e}", exc_info=True)
+            return []
+
+    def _create_empty_opportunity(self, symbol: str) -> TokenOpportunity:
+        return TokenOpportunity(
+            symbol=symbol,
+            entry_recommendation="INSUFFICIENT_DATA"
+        )
+
+    async def analyze_token_async(self, session: aiohttp.ClientSession, symbol: str) -> TokenOpportunity:
+        df = await self._fetch_historical_data_from_db(symbol)
+        if df is None or len(df) < 25:
+            logger.warning(f"Insufficient data for {symbol} after DB fetch for analysis.")
+            return self._create_empty_opportunity(symbol)
+        
+        try:
+            current_price = float(df["close"].iloc[-1])
+            rsi_val = self._calculate_rsi(df["close"])
+
+            price_1h = ((current_price - df["close"].iloc[-60]) / df["close"].iloc[-60] * 100) if len(df) >= 61 and df["close"].iloc[-60] != 0 else 0.0
+            price_4h = ((current_price - df["close"].iloc[-240]) / df["close"].iloc[-240] * 100) if len(df) >= 241 and df["close"].iloc[-240] != 0 else 0.0
+            price_24h = ((current_price - df["close"].iloc[-1440]) / df["close"].iloc[-1440] * 100) if len(df) >= 1441 and df["close"].iloc[-1440] != 0 else 0.0
+            
+            volatility_val = self.calculate_volatility(df["close"])
+            returns_vec_val = self.calculate_returns_vector(df["close"])
+            
+            long_score, short_score = 0, 0
+            current_volume_spike_flag, support_bounce_flag, mta_bullish_flag = False, False, False
+            resistance_rejection_flag, mta_bearish_flag = False, False
+
+            if len(df) >= 20:
+                volume_idx = -2 if len(df['volume']) >= 2 else -1
+                rolling_mean_vol = df["volume"].rolling(20).mean()
+                avg_volume_idx = -2 if len(rolling_mean_vol) >=2 else -1
+                current_candle_volume = df["volume"].iloc[volume_idx]
+                avg_volume_20 = rolling_mean_vol.iloc[avg_volume_idx] if not rolling_mean_vol.empty and avg_volume_idx < 0 and abs(avg_volume_idx) <= len(rolling_mean_vol) else 0
+
+
+                if avg_volume_20 > 0 and current_candle_volume > (avg_volume_20 * VOLUME_SPIKE_FACTOR):
+                    current_volume_spike_flag = True
+                    if rsi_val < RSI_OVERSOLD + 5: long_score += 40
+                    if rsi_val > RSI_OVERBOUGHT - 5: short_score += 40
+            
+            support_levels = self.detect_support_levels(df)
+            if support_levels and current_price > 0:
+                nearest_support = min(support_levels, key=lambda x: abs(x - current_price))
+                if abs(current_price - nearest_support) / current_price < 0.01 and price_1h > -1:
+                    long_score += 30
+                    support_bounce_flag = True
+            
+            bullish_timeframes = sum([price_1h > 0, price_4h > 0, price_24h > -2])
+            if bullish_timeframes >= 2:
+                long_score += 25
+                mta_bullish_flag = True
+            
+            resistance_levels = self.detect_resistance_levels(df)
+            if resistance_levels and current_price > 0:
+                nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
+                if abs(current_price - nearest_resistance) / current_price < 0.01 and price_1h < 1:
+                    short_score += 30
+                    resistance_rejection_flag = True
+            
+            bearish_timeframes = sum([price_1h < 0, price_4h < 0, price_24h < 2])
+            if bearish_timeframes >= 2:
+                short_score += 25
+                mta_bearish_flag = True
+            
+            if len(df) >= 50:
+                rolling_high_window = min(20, len(df) -1)
+                idx_high_20 = -(rolling_high_window) if rolling_high_window > 0 else -1
+                df_rolling_high = df["high"].rolling(rolling_high_window).max()
+                high_20 = df_rolling_high.iloc[idx_high_20] if rolling_high_window > 0 and not df_rolling_high.empty and abs(idx_high_20) <= len(df_rolling_high) else current_price
+                
+                recent_high_window = min(5, len(df))
+                recent_high = df["high"].tail(recent_high_window).max() if recent_high_window > 0 else current_price
+                if recent_high > high_20 * 0.995 and current_price < high_20:
+                    short_score += 20
+            
+            BUY_THRESHOLD = 60
+            direction_val, entry_recommendation_val = "NEUTRAL", "NEUTRAL"
+            if long_score >= BUY_THRESHOLD and short_score < 40: direction_val, entry_recommendation_val = "LONG", "BUY_LONG"
+            elif short_score >= BUY_THRESHOLD and long_score < 40: direction_val, entry_recommendation_val = "SHORT", "BUY_SHORT"
+            elif long_score >= 30 and short_score < 30: direction_val, entry_recommendation_val = "LONG", "WAIT_LONG"
+            elif short_score >= 30 and long_score < 30: direction_val, entry_recommendation_val = "SHORT", "WAIT_SHORT"
+            
+            composite_score_val = max(long_score, short_score)
+
+            return TokenOpportunity(
+                symbol=symbol, current_price=round(current_price, 4),
+                price_change_1h=round(price_1h, 2), price_change_4h=round(price_4h, 2), price_change_24h=round(price_24h, 2),
+                rsi=round(rsi_val, 2), volume_spike=current_volume_spike_flag, support_bounce=support_bounce_flag,
+                resistance_rejection=resistance_rejection_flag, multi_timeframe_alignment=(mta_bullish_flag or mta_bearish_flag),
+                composite_score=round(composite_score_val, 2), entry_recommendation=entry_recommendation_val,
+                volatility=round(volatility_val, 2), returns_vec=returns_vec_val,
+                long_score=round(long_score, 2), short_score=round(short_score, 2), direction=direction_val
+            )
+        except Exception as e:
+            logger.error(f"Error in analyze_token_async for {symbol}: {e}", exc_info=True)
+            return self._create_empty_opportunity(symbol)
+
+    def save_analysis_results(self, opportunities: List[TokenOpportunity], market_regime_info: Optional[Dict] = None, perf_metrics: Optional[Dict] = None):
+        results_metadata = {
+            "tokens_analyzed": len(opportunities),
+            "analysis_version": "enhanced_v2.4_cascade_final", 
+        }
+        if market_regime_info:
+            results_metadata.update({
+                "market_regime": market_regime_info.get("regime", "UNKNOWN"),
+                "market_regime_confidence": market_regime_info.get("confidence", 0.0),
+                "market_regime_details": market_regime_info.get("details", "")
+            })
+        if perf_metrics:
+             results_metadata["performance_metrics"] = perf_metrics
+
+        output_data = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "metadata": results_metadata,
+            "opportunities": []
+        }
+        for opp in opportunities:
+            output_data["opportunities"].append({
+                "symbol": opp.symbol, "current_price": opp.current_price,
+                "composite_score": opp.composite_score, "long_score": opp.long_score, "short_score": opp.short_score,
+                "direction": opp.direction, "entry_recommendation": opp.entry_recommendation,
+                "price_changes": {"1h": opp.price_change_1h, "4h": opp.price_change_4h, "24h": opp.price_change_24h},
+                "technical_indicators": {
+                    "rsi": opp.rsi, "volume_spike": opp.volume_spike, "support_bounce": opp.support_bounce,
+                    "resistance_rejection": opp.resistance_rejection, "multi_timeframe_alignment": opp.multi_timeframe_alignment
+                },
+                "volatility": opp.volatility
+            })
+        try:
+            with open(OUTPUT_FILE, 'w') as f: json.dump(output_data, f, indent=2)
+            logger.info(f"Analysis results saved to {OUTPUT_FILE}")
+            with open(DEBUG_FILE, 'w') as f: json.dump(output_data, f, indent=2) 
+            logger.info(f"Debug analysis results saved to {DEBUG_FILE}")
+        except Exception as e:
+            logger.error(f"Error saving analysis results: {e}", exc_info=True)
+
+async def main():
+    start_time_main = time.time()
+    logger.info(f"Starting enhanced multi-token analysis (version: enhanced_v2.4_cascade_final) from {__file__}...")
+    
+    analyzer = EnhancedTokenAnalyzer(DB_PATH)
+    market_regime_info = analyzer.regime_detector.detect_regime()
+    logger.info(f"Market Regime Detected: {market_regime_info}")
+    
+    async with aiohttp.ClientSession() as session:
+        api_fetch_start = time.time()
+        symbols_to_analyze = await analyzer.validate_symbols(session)
+        api_fetch_duration = (time.time() - api_fetch_start) * 1000
+        logger.info(f"Symbols validated in {api_fetch_duration:.0f}ms. Analyzing {len(symbols_to_analyze)} symbols: {str(symbols_to_analyze)[:200]}")
+
+
+        if not symbols_to_analyze:
+            logger.warning("No symbols to analyze after validation. Saving empty result.")
+            perf = {"api_fetch_ms": int(api_fetch_duration), "analysis_compute_ms": 0, "total_elapsed_ms": int((time.time() - start_time_main) * 1000), "tokens_requested": 0, "tokens_successfully_processed": 0}
+            analyzer.save_analysis_results([], market_regime_info, perf_metrics=perf)
+            return
+
+        analysis_compute_start = time.time()
+        tasks = [analyzer.analyze_token_async(session, symbol) for symbol in symbols_to_analyze]
+        analysis_results = await asyncio.gather(*tasks, return_exceptions=True)
+        analysis_compute_duration = (time.time() - analysis_compute_start) * 1000
+        
+        opportunities_list: List[TokenOpportunity] = []
+        for i, res in enumerate(analysis_results):
+            symbol_for_log = symbols_to_analyze[i] if i < len(symbols_to_analyze) else "UNKNOWN_SYMBOL_INDEX_ERROR"
+            if isinstance(res, TokenOpportunity):
+                opportunities_list.append(res)
+            elif isinstance(res, Exception):
+                logger.error(f"Exception during analysis for symbol {symbol_for_log}: {res}", exc_info=True)
+                opportunities_list.append(analyzer._create_empty_opportunity(symbol_for_log)) 
+            else:
+                 logger.warning(f"Unexpected result type from analyze_token_async for {symbol_for_log}: {type(res)}")
+                 opportunities_list.append(analyzer._create_empty_opportunity(symbol_for_log))
+
+
+        opportunities_list.sort(key=lambda x: x.composite_score, reverse=True)
+    
+    total_elapsed_main = (time.time() - start_time_main) * 1000
+    
+    successfully_processed_count = len([
+        opp for opp in opportunities_list 
+        if opp.entry_recommendation != "INSUFFICIENT_DATA"
+    ])
+
+    performance_metrics = {
+        "api_fetch_ms": int(api_fetch_duration),
+        "analysis_compute_ms": int(analysis_compute_duration),
+        "total_elapsed_ms": int(total_elapsed_main),
+        "tokens_requested": len(symbols_to_analyze),
+        "tokens_successfully_processed": successfully_processed_count
+    }
+    
+    analyzer.save_analysis_results(opportunities_list, market_regime_info, perf_metrics=performance_metrics)
+    
+    logger.info(f"Enhanced analysis complete: {len(opportunities_list)} tokens results generated in {total_elapsed_main:.0f}ms ({successfully_processed_count} successfully processed). Output: {OUTPUT_FILE}")
+    if opportunities_list and successfully_processed_count > 0 :
+        top_real_opp = next((opp for opp in opportunities_list if opp.entry_recommendation != "INSUFFICIENT_DATA"), None)
+        if top_real_opp:
+             logger.info(f"Top scorable opportunity: {top_real_opp.symbol} (L: {top_real_opp.long_score}, S: {top_real_opp.short_score}, Rec: {top_real_opp.entry_recommendation})")
+        else:
+            logger.info("No scorable opportunities found despite processing.")
+    else:
+        logger.info("No scorable opportunities found or processed.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
