@@ -24,7 +24,7 @@ class AnalyticsAPI:
     def get_latest_data(self):
         """Get latest candle data for all symbols"""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
             cursor = conn.cursor()
             
             # Get latest timestamp for each symbol
@@ -122,6 +122,7 @@ async def create_app():
     # Add routes
     app.router.add_get('/api/latest', api.handle_latest)
     app.router.add_get('/api/status', api.handle_status)
+    app.router.add_get('/healthz', api.handle_status)
     app.router.add_get('/api/analysis', api.handle_analysis) # Added new route
     
     return app
@@ -138,6 +139,7 @@ async def main():
     logger.info("Endpoints:")
     logger.info("  GET /api/latest - Latest market data")
     logger.info("  GET /api/status - Service status")
+    logger.info("  GET /healthz   - Health probe (alias)")
     logger.info("  GET /api/analysis - Token analysis results") # Added log for new endpoint
     
     # Keep server running
