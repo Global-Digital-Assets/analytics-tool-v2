@@ -2,14 +2,10 @@
 
 # Core Token List
 DEFAULT_TOKENS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "SOLUSDT", "DOGEUSDT",
-    "TRXUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT", "NEARUSDT", "ATOMUSDT",
-    "ARBUSDT", "OPUSDT", "INJUSDT", "SUIUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT",
-    "TRUMPUSDT", "FETUSDT", "SUSHIUSDT", "APTUSDT", "WLDUSDT", "TIAUSDT", "TAOUSDT",
-    "ETCUSDT", "AAVEUSDT",
-    # New additions - 10 tokens for enhanced coverage
-    "LPTUSDT", "ENAUSDT", "RVNUSDT", "VIRTUALUSDT", "TRBUSDT",
-    "LDOUSDT", "UNIUSDT", "FILUSDT", "MASKUSDT", "EIGENUSDT"
+    "AAVEUSDT", "ADAUSDT", "APTUSDT", "ARBUSDT", "ATOMUSDT", "AVAXUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT", "DOTUSDT",
+    "EIGENUSDT", "ENAUSDT", "ETCUSDT", "ETHUSDT", "FETUSDT", "FILUSDT", "INJUSDT", "LDOUSDT", "LINKUSDT", "LPTUSDT",
+    "LTCUSDT", "MASKUSDT", "NEARUSDT", "OPUSDT", "PEPEUSDT", "RVNUSDT", "SHIBUSDT", "SOLUSDT", "SUIUSDT", "SUSHIUSDT",
+    "TAOUSDT", "TIAUSDT", "TRBUSDT", "TRUMPUSDT", "TRXUSDT", "UNIUSDT", "VIRTUALUSDT", "WIFUSDT", "WLDUSDT", "XRPUSDT",
 ]
 
 # Technical Analysis Parameters
@@ -31,3 +27,22 @@ LOG_FILE_OVERRIDE = None
 
 # Logging
 LOG_LEVEL = "INFO"  # e.g., "DEBUG", "INFO", "WARNING", "ERROR"
+
+# --- Advanced ML / Institutional Parameters (optional) ---
+# Leave defaults if you are not using the ML scoring engine
+MEME_TOKENS = []  # Additional meme-coin universe (optional)
+
+# Paths for the scoring model / feature scaler – used by continuous learner & analyzer
+ML_MODEL_PATH = None  # e.g. "models/latest_model.pkl"
+SCALER_PATH = None  # e.g. "models/latest_scaler.pkl"
+
+# Correlation & regime parameters
+CORRELATION_WINDOW = 90  # Rolling window (candles) for BTC/ETH correlation assessment
+CORRELATION_PENALTY_FACTOR = 0.3  # Weight to reduce score when highly correlated
+REGIME_MULTIPLIER_BEAR = 0.8  # Global multiplier in bear regimes
+REGIME_MULTIPLIER_BULL = 0.8  # Global multiplier in bull regimes
+
+# Scoring & training behaviour
+PERCENTILE_RANKING = True  # Use cross-sectional percentile instead of absolute score
+DATA_DRIVEN_SCORING = False  # Flip to True if ML model is available
+MIN_TRAINING_SAMPLES = 1000  # Guardrail for continuous learner

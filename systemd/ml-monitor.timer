@@ -1,0 +1,10 @@
+[Unit]
+Description=Run ML Drift Monitor every 4 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=4h
+Unit=ml-monitor.service
+
+[Install]
+WantedBy=timers.target

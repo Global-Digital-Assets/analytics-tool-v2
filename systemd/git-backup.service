@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Git auto-backup (VPS → origin)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/analytics-tool-v2
+ExecStart=/usr/bin/env bash /root/analytics-tool-v2/git_backup.sh
+Environment=GIT_SSH_COMMAND=/usr/bin/ssh -i /root/.ssh/binance_futures_tool -o StrictHostKeyChecking=no
+
+[Install]
+WantedBy=multi-user.target

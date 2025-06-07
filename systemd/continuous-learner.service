@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly Continuous Learner (LightGBM incremental training)
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/analytics-tool-v2
+ExecStart=/usr/bin/env python3 /root/analytics-tool-v2/continuous_learner.py
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=60s
+
+[Install]
+WantedBy=multi-user.target

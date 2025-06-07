@@ -1,0 +1,15 @@
+[Unit]
+Description=Multi Token Analyzer (2-min interval)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/analytics-tool-v2
+# Ensures Python output is flushed immediately so journal shows live logs
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/env python3 /root/analytics-tool-v2/multi_token_analyzer.py
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

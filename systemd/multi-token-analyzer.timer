@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Multi Token Analyzer every 2 minutes
+Requires=multi-token-analyzer.service
+
+[Timer]
+Unit=multi-token-analyzer.service
+OnBootSec=30s
+OnUnitActiveSec=120s
+
+[Install]
+WantedBy=timers.target

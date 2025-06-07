@@ -15,14 +15,9 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Token list - 30 major tokens
-TOKENS = [
-    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'SOLUSDT', 'DOGEUSDT',
-    'TRXUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT', 'LTCUSDT', 'NEARUSDT', 'ATOMUSDT',
-    'ARBUSDT', 'OPUSDT', 'INJUSDT', 'SUIUSDT', 'PEPEUSDT', 'SHIBUSDT', 'WIFUSDT',
-    'FETUSDT', 'SUSHIUSDT', 'APTUSDT', 'WLDUSDT', 'TIAUSDT', 'TAOUSDT', 'ETCUSDT',
-    'AAVEUSDT', 'TRUMPUSDT'
-]
+# Import tokens from config
+from config import DEFAULT_TOKENS
+TOKENS = DEFAULT_TOKENS
 
 class DataStreamer:
     def __init__(self):

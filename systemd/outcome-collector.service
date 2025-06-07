@@ -1,0 +1,14 @@
+[Unit]
+Description=Outcome Collector Daemon (prediction scoring)
+After=network-online.target
+
+[Service]
+User=root
+WorkingDirectory=/root/analytics-tool-v2
+ExecStart=/usr/bin/env python3 /root/analytics-tool-v2/outcome_collector.py
+Restart=on-failure
+RestartSec=30s
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

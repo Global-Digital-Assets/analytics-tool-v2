@@ -58,4 +58,4 @@ for token in opportunities:
     simple_long = token.get("simple_long_action", "")
     simple_short = token.get("simple_short_action", "")
     
-    print(f"{symbol:10s} | Long: {long_score:2d} ({simple_long:13s}) | Short: {short_score:2d} ({simple_short:11s})")
+    print(f"{symbol:10s} | Long: {long_score:5.1f} ({simple_long:13s}) | Short: {short_score:5.1f} ({simple_short:11s})")

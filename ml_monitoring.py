@@ -17,6 +17,9 @@ import numpy as np
 from sklearn.metrics import roc_auc_score, accuracy_score
 import lightgbm as lgb
 
+# For systemd retrain hooks
+import subprocess
+
 logger = logging.getLogger(__name__)
 
 class MLMonitoringSystem:
@@ -121,6 +124,21 @@ class MLMonitoringSystem:
             # Extract CV baseline from metadata for proper drift detection
             cv_baseline_auc = metadata.get('cross_validation', {}).get('mean_auc', 0.785)
             
+            alerts = self._generate_alerts(current_accuracy, current_auc, abs(current_accuracy - 0.90), abs(current_auc - cv_baseline_auc))
+            
+            # If alerts and TELEGRAM configured, send one combined message
+            if alerts and os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
+                try:
+                    import requests
+                    bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+                    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+                    alert_text = "\n".join(alerts)
+                    payload = {"chat_id": chat_id, "text": f"🚨 ML Monitor Alerts:\n{alert_text}"}
+                    requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload, timeout=10)
+                    logger.info("📨 Telegram alerts sent")
+                except Exception as te:
+                    logger.warning(f"⚠️ Failed to send Telegram alert: {te}")
+            
             evaluation_results = {
                 "timestamp": datetime.now().isoformat(),
                 "model_version": metadata['model_info']['timestamp'],
@@ -139,7 +157,7 @@ class MLMonitoringSystem:
                     "evaluation_period_days": days_back
                 },
                 "baseline_auc": cv_baseline_auc,  # Use CV mean as realistic baseline
-                "alerts": self._generate_alerts(current_accuracy, current_auc, abs(current_accuracy - 0.90), abs(current_auc - cv_baseline_auc))
+                "alerts": alerts
             }
             
             # Log to monitoring database
@@ -259,6 +277,17 @@ class MLMonitoringSystem:
             
             if success:
                 logger.info(f"✅ Automated {retrain_decision['retrain_type']} retrain completed successfully")
+                # Trigger full monthly_retrain.service via systemd for provenance & logging
+                if retrain_decision['retrain_type'] in {"emergency", "drift_hotfix"}:
+                    _svc = "monthly_retrain.service"
+                    try:
+                        result = subprocess.run(["systemctl", "start", _svc], check=False)
+                        if result.returncode == 0:
+                            logger.info(f"📟 Systemd hook: {_svc} started OK")
+                        else:
+                            logger.warning(f"⚠️ Systemd hook {_svc} returned code {result.returncode}")
+                    except Exception as sys_exc:
+                        logger.warning(f"⚠️ Could not trigger systemd service {_svc}: {sys_exc}")
                 return True
             else:
                 logger.error(f"❌ Automated {retrain_decision['retrain_type']} retrain failed")

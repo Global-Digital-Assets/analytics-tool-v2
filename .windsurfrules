@@ -1,0 +1,145 @@
+1. Code Style & Quality (Python‑centric)
+* PEP 8 + PEP 257 complianceEnforce with Black (formatter) + Flake8 (linter) + pydocstyle for docstrings.
+* Type hints everywhereRun mypy --strict in CI; avoid Any except when truly unavoidable.
+* Immutable data modelsUse @dataclass(frozen=True) or Pydantic BaseModel with Config.allow_mutation=False.
+2. Dependency & Environment Management
+* Poetry or pip‑tools for reproducible installs:
+    * Lock poetry.lock / requirements.txt.
+    * Pin to exact versions; review lockfile diffs in PRs.
+* Virtual environments per project (no global installs).
+* Separate Dockerfiles for dev vs. prod; multi‑stage builds to minimize image size.
+3. Configuration & Secrets
+* Pydantic BaseSettings backed by ENV + .env for typed config.
+* Never import os.getenv throughout code—read all settings at bootstrap, pass via constructor.
+* Vault or AWS Secrets Manager for production; fall back to env‑vars in staging/dev.
+4. Packaging & Releases
+* Structure as a proper Python package (src/ layout).
+* Use setup.cfg/pyproject.toml metadata; publish to private PyPI if reusable.
+* Automate changelog & version bump via Commitizen or Semantic‑Release.
+5. VPS Deployment & Web Server
+* Docker Compose (or Kubernetes) on VPS for service isolation.
+* Nginx → Gunicorn/Uvicorn reverse proxy:
+    * Set worker_processes = auto, timeout = 30s.
+    * Run Gunicorn as a systemd service with proper User/Group.
+* Firewall (ufw or iptables): only open ports 80/443 and SSH.
+* Let’s Encrypt (Certbot) auto‑renew for TLS; verify via cron or systemd timer.
+6. Crypto & Binance Integration
+* Use the official python‑binance SDK (or CCXT if multi‑exchange).
+* Decimal‑based arithmetic (decimal.Decimal) for price/qty—never floats.
+* API rate‑limit handler: wrap calls with exponential backoff + jitter.
+* Idempotency for order placement: generate unique clientOrderId.
+* Maintain a local ledger DB of sent orders + responses to reconcile fills.
+7. Security & Key Management
+* Store API keys in encrypted vault; load at runtime, never commit.
+* Restrict Binance key permissions (e.g. disable withdrawals unless testnet).
+* Validate server time against NTP to avoid signature errors.
+* Enable HTTP headers: HSTS, X‑Frame‑Options, Content Security Policy.
+8. Testing & CI/CD (Python Flavour)
+* pytest with plugins:
+    * pytest‑asyncio for async routes
+    * pytest‑mock / vcr.py for replaying Binance HTTP interactions
+* FactoryBoy or faker for test data; avoid live‑trading in CI (use testnet mocks).
+* CI pipeline:
+    1. Black → Flake8 → MyPy
+    2. Unit tests → Coverage (→ fail if < 90 %)
+    3. Build Docker image → Push to registry → Deploy to staging
+9. Logging, Monitoring & Alerting
+* Structured JSON logs via structlog or loguru; include request_id, user_id.
+* Expose Prometheus metrics endpoint; track order rates, latencies, error counts.
+* Integrate Sentry for exception capture (with PII scrubbing).
+10. Performance & Scalability
+* Async frameworks (FastAPI / AIOHTTP) for high‑throughput I/O.
+* Offload long‑running tasks (e.g. heavy charting, backtests) to Celery + Redis.
+* Use Redis or Memcached for caching rate‑limit buckets, market data TTL.
+CRYPTO ANALYTICS TOOL
+Connect to your Hetzner server:ssh -i ~/.ssh/binance_futures_tool root@78.47.150.122
+
+Hetzner server SSH key
+-----BEGIN OPENSSH PRIVATE KEY-----b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZWQyNTUxOQAAACCgKpg75l42bl6nqPGB19mhr3u/FvLqpVM+F6h83KfQngAAAKA5gORcOYDkXAAAAAtzc2gtZWQyNTUxOQAAACCgKpg75l42bl6nqPGB19mhr3u/FvLqpVM+F6h83KfQngAAAECVjT6ZU1OJy2CpOaaBDrABKwO/XHGsxASibDLcrTBy+qAqmDvmXjZuXqeo8YHX2aGve78W8uqlUz4XqHzcp9CeAAAAHWJpbmFuY2UtZnV0dXJlcy10b29sLTIwMjUwNjAx-----END OPENSSH PRIVATE KEY-----
+
+
+CRYPTO ML ANALYTICS TOOL — PRODUCTION GUIDE(last updated 2025-06-07 17:20 UTC, version v2.5-cascade)
+──────────────────────────────────────────────────────── 🚀 PRODUCTION SERVER• IP / Port  78.47.150.122 : 8080• Host path  /root/analytics-tool-v2• SSH    
+ssh -i ~/.ssh/binance_futures_tool root@78.47.150.122
+• Source-of-truth Code + data live on the VPS (Git = backup mirror only)
+
+──────────────────────────────────────────────────────── 📡 LIVE API ENDPOINTS
+| Route | Purpose | Example | |-------|---------|---------| | GET /api/analysis | Full JSON of all tracked tokens with raw scores & simple actions | returns ≈30 entries every 15 min | | GET /api/signals | Actionable signals only (score ≥ 60 %, side = LONG / SHORT) | empty list when no trades | | GET /api/latest | Latest 1-min candle per token | | GET /api/status / /healthz | Liveness & DB connectivity | | GET /api/performance | 90-day model performance snapshot |
+API process: simple_api_server.py (systemd unit: analytics-api.service).
+──────────────────────────────────────────────────────── 💎 TOKEN COVERAGE (“Top 30”)BTC, ETH, BNB, ADA, SOL, XRP, DOT, LINK, AVAX, ATOM, TRX, LTC, FIL … + 17 others.Universe can be extended via 
+token_list.json in the repo; streamer auto-discovers.
+
+──────────────────────────────────────────────────────── 🤖 ML PIPELINE & METHODOLOGY• Model    LightGBM (binary long / short classifiers)• Features  11 engineered signals (RSI, momentum, volatility bands, order-book imbalance, etc.) + meta-features (regime, macro).• Training cadence– Nightly incremental 
+continuous_learner.service (02:30 UTC).
+– Monthly cold-start monthly_retrain.service + monthly_retrain.timer (1st Sun 02:00 UTC).
+• Versioning Models saved in models/ as <timestamp>_<tag>.txt; symlinks latest_model.txt, latest_monthly.txt etc.
+• Accuracy  Current live model ≈ 94 % hit-rate, 0.82 AUC (back-test).
+• Drift & Perf ml_monitoring.py runs hourly; Telegram bot alerts on drift/perf drop.
+
+──────────────────────────────────────────────────────── 📂 KEY FILE / DIR MAP
+
+
+CopyInsert
+analytics-tool-v2/
+├─ simple_api_server.py       ← aiohttp API (port 8080)
+├─ microstructure_streamer.py ← 1-min candles → SQLite
+├─ microstructure_feature_aggregator.py
+├─ production_ml_pipeline.py  ← main train/infer class
+├─ continuous_learner.py      ← nightly warm retrain
+├─ run_retrain.sh             ← monthly cold retrain wrapper
+├─ ml_monitoring.py           ← drift / perf / Telegram
+├─ market_data.db             ← live candle DB (~850 MB)
+├─ multi_token_analysis.json  ← last analysis payload (API reads)
+├─ venv/                      ← Python 3.10, pinned reqs.txt
+└─ systemd units in /etc/systemd/system
+──────────────────────────────────────────────────────── 🛠️ SYSTEMD SERVICES
+| Unit | Role | Notes | |------|------|-------| | microstructure-streamer.service | live Binance WS → DB | auto-restart | | feature-aggregator.service | aggregates & writes factors | every 1 min | | continuous_learner.service | nightly warm retrain | 02:30 UTC | | monthly_retrain.service | cold 365-day retrain | via 
+monthly_retrain.timer | | analytics-api.service | serves endpoints | port 8080 | | monitoring_alerts.service | drift & health alerts (Telegram) | every 15 min |
+
+Logs default to 
+/var/log/syslog or journalctl ‑u <unit>; custom files (streamer.log, analyzer.log) in project root.
+
+──────────────────────────────────────────────────────── 🔧 COMMON OPS COMMANDS (SSH)
+
+
+CopyInsert
+# Check health
+curl -s http://78.47.150.122:8080/api/status | jq .
+
+# Service status / restart
+systemctl status analytics-api microstructure-streamer
+systemctl restart analytics-api
+
+# Tail live analysis log
+tail -f /root/analytics-tool-v2/analyzer.log
+
+# Force immediate full retrain
+sudo systemctl start monthly_retrain.service
+──────────────────────────────────────────────────────── 🛡️ SELF-HEALING & BACKUPS• Process watchdog (
+process_watchdog.sh) restarts crashed services.
+• Daily DB dump backup_system.sh → /root/backups/ (7-day rotation).
+• Logs rotated weekly (logrotate.d/analytics).
+• Security: SSH-key only, API bound to public port but no auth (internal use).
+
+──────────────────────────────────────────────────────── 📦 DEPENDENCIES (PINNED)
+
+CopyInsert
+lightgbm==4.6.0   polars==1.8.2
+aiohttp==3.10.11  python-binance==1.0.29
+pandas==1.5.3     numpy==1.24.3
+scikit-learn==1.3.2
+──────────────────────────────────────────────────────── 🔄 DEV WORKFLOW
+1. VPS is canonical.
+2. Push snapshots to Git: git bundle create backup.bundle --all.
+3. Pull bundle locally → push to GitHub mirror:https://github.com/Global-Digital-Assets/analytics-tool-v2 (branch main).
+4. Never overwrite live code without tar/DB backup.
+──────────────────────────────────────────────────────── 📊 CURRENT SYSTEM STATUS (as of 2025-06-07)✓ Data ingestion: up (1-min candles)✓ ML analysis: every 15 min (48 s run time)✓ API: responsive (21 KB JSON)✓ Backups: last OK @ 02:05 UTC✓ Uptime: 99.9 % (self-healing)Active trade signals: none (all scores < 60 %).
+──────────────────────────────────────────────────────── For any onboarding developer:
+1. SSH into the server (key in Vault).
+2. Activate venv → python simple_api_server.py for local tests.
+3. Use /api/analysis for full token universe; /api/signals for thresholded trades.
+4. Monthly retrain & nightly learner are autonomous via systemd timers.
+
+
+
+

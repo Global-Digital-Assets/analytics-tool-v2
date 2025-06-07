@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Continuous Learner nightly
+
+[Timer]
+OnCalendar=*-*-* 02:10
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

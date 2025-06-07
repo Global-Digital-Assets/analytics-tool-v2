@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule Monthly Full ML Retrain
+
+[Timer]
+# First Sunday of every month at 02:00 UTC
+OnCalendar=Sun *-*-01..07 02:00:00
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

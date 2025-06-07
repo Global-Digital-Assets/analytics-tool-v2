@@ -1,0 +1,20 @@
+[Unit]
+Description=Monthly Full ML Retrain (cold-start, A/B promote)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Run as root on the VPS – adjust if you deploy under another user
+User=root
+WorkingDirectory=/root/analytics-tool-v2
+# Cold retrain on 365-day window, tag=monthly (no warm-start)
+ExecStart=/root/analytics-tool-v2/run_retrain.sh --mode full --days 365 --tag monthly
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+# Prevent overlap – systemd will refuse to start if previous run still active
+RuntimeMaxSec=6h
+
+[Install]
+WantedBy=multi-user.target

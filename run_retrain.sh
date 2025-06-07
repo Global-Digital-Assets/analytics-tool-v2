@@ -71,6 +71,22 @@ echo "Exit Code: $RETRAIN_EXIT_CODE" | tee -a "$LOG_FILE"
 if [ $RETRAIN_EXIT_CODE -eq 0 ]; then
     echo "✅ Retrain successful, testing inference..." | tee -a "$LOG_FILE"
     timeout 30s $VENV_PYTHON "$ANALYTICS_DIR/ml_inference_engine.py" --test >> "$LOG_FILE" 2>&1 || true
+
+    # ---- A/B Deployment Promote Step ----
+    TAG_LOWER="${TAG,,}"  # lower-case tag for consistency
+    LATEST_TAG_MODEL="$ANALYTICS_DIR/models/latest_model_${TAG_LOWER}.txt"
+    LATEST_MODEL_GENERIC="$ANALYTICS_DIR/models/latest_model.txt"
+    LATEST_TAG_META="$ANALYTICS_DIR/models/latest_metadata_${TAG_LOWER}.json"
+    LATEST_META_GENERIC="$ANALYTICS_DIR/models/latest_metadata.json"
+
+    if [ -e "$LATEST_TAG_MODEL" ]; then
+        ln -sfn "$LATEST_TAG_MODEL" "$LATEST_MODEL_GENERIC"
+        echo "🔀 Promoted $LATEST_TAG_MODEL -> latest_model.txt" | tee -a "$LOG_FILE"
+    fi
+    if [ -e "$LATEST_TAG_META" ]; then
+        ln -sfn "$LATEST_TAG_META" "$LATEST_META_GENERIC"
+        echo "🔀 Promoted $LATEST_TAG_META -> latest_metadata.json" | tee -a "$LOG_FILE"
+    fi
 else
     echo "❌ Retrain failed!" | tee -a "$LOG_FILE"
 fi

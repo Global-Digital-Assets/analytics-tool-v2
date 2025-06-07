@@ -6,7 +6,6 @@ Features: ML-based scoring, cross-sectional ranking, correlation penalties, regi
 """
 
 import asyncio
-import aiohttp
 import logging
 import sqlite3
 import pandas as pd
@@ -20,13 +19,6 @@ import os
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
-import yaml
-import uuid
-import prediction_db
-
-# Utility to parse boolean env vars
-def _env_flag(name: str, default: str = "False") -> bool:
-    return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
 
 # Enhanced imports for institutional-grade features
 try:
@@ -40,19 +32,6 @@ try:
 except ImportError:
     ML_AVAILABLE = False
     print("⚠️ ML libraries not available. Using rule-based scoring.")
-
-# Feature flags (can be overridden by environment variables)
-ENABLE_ADAPTIVE_TIERS = _env_flag("ENABLE_ADAPTIVE_TIERS", "False")
-ENABLE_MICROSTRUCTURE_STATS = _env_flag("ENABLE_MICROSTRUCTURE_STATS", "False")
-ENABLE_REGIME_THRESHOLDS = _env_flag("ENABLE_REGIME_THRESHOLDS", "False")
-
-# Threshold matrix for regime-based thresholds
-THRESHOLD_MATRIX = {
-    'trending_volatile': {'entry': 1.2, 'noise': 0.8},
-    'trending_calm': {'entry': 1.5, 'noise': 0.5},
-    'choppy': {'entry': 2.0, 'noise': 1.0},
-    'squeeze': {'entry': 1.0, 'noise': 0.3},
-}
 
 # --- Configuration ---
 # Attempt to import from config.py, with fallbacks if not found or incomplete
@@ -71,7 +50,6 @@ try:
         VOLUME_SPIKE_FACTOR as CFG_VOLUME_SPIKE_FACTOR,
         TOKEN_LIST_URL as CFG_TOKEN_LIST_URL,
         DEFAULT_TOKENS as CFG_DEFAULT_TOKENS,
-        MEME_TOKENS as CFG_MEME_TOKENS,
         ANALYSIS_CANDLE_LIMIT as CFG_ANALYSIS_CANDLE_LIMIT,
         API_TIMEOUT as CFG_API_TIMEOUT,
         DB_PATH_OVERRIDE as CFG_DB_PATH_OVERRIDE,
@@ -95,7 +73,6 @@ try:
     VOLUME_SPIKE_FACTOR = CFG_VOLUME_SPIKE_FACTOR
     TOKEN_LIST_URL = CFG_TOKEN_LIST_URL
     DEFAULT_TOKENS = CFG_DEFAULT_TOKENS
-    MEME_TOKENS = CFG_MEME_TOKENS
     ANALYSIS_CANDLE_LIMIT = CFG_ANALYSIS_CANDLE_LIMIT
     API_TIMEOUT = CFG_API_TIMEOUT
     ANALYSIS_OUTPUT_FILE = 'multi_token_analysis.json'
@@ -124,9 +101,7 @@ except ImportError:
     RSI_OVERBOUGHT = 70
     VOLUME_SPIKE_FACTOR = 2.0
     TOKEN_LIST_URL = "https://api.binance.com/api/v3/exchangeInfo"
-    # Legacy 5-token fallback removed – config import should always succeed
-    DEFAULT_TOKENS = []
-    MEME_TOKENS = []
+    DEFAULT_TOKENS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "TRXUSDT", "LTCUSDT", "LINKUSDT", "DOTUSDT", "AVAXUSDT", "ATOMUSDT", "SHIBUSDT", "PEPEUSDT", "ARBUSDT", "OPUSDT", "NEARUSDT", "INJUSDT", "TAOUSDT", "FETUSDT", "SUIUSDT", "WIFUSDT", "TIAUSDT", "AAVEUSDT", "APTUSDT", "SUSHIUSDT", "WLDUSDT", "ETCUSDT", "TRUMPUSDT"]
     ANALYSIS_CANDLE_LIMIT = 1500
     API_TIMEOUT = 10
     ANALYSIS_OUTPUT_FILE = 'multi_token_analysis.json'
@@ -146,24 +121,6 @@ except ImportError:
     PERCENTILE_RANKING = True
     DATA_DRIVEN_SCORING = ML_AVAILABLE
     MIN_TRAINING_SAMPLES = 1000
-
-# Threshold config path
-THRESHOLD_CONFIG_PATH = os.path.join(SCRIPT_DIR, 'thresholds.yml')
-if os.path.exists(THRESHOLD_CONFIG_PATH):
-    with open(THRESHOLD_CONFIG_PATH, 'r') as f:
-        _threshold_cfg = yaml.safe_load(f) or {}
-else:
-    _threshold_cfg = {}
-
-DEFAULT_THRESHOLDS = {
-    'majors': {'long': 60, 'short': 60},
-    'memes': {'long': 65, 'short': 55}
-}
-
-TIERED_THRESHOLDS = {
-    cat: _threshold_cfg.get(cat, DEFAULT_THRESHOLDS[cat])
-    for cat in DEFAULT_THRESHOLDS
-}
 
 # Threshold constants
 BUY_THRESHOLD = 60  # Score threshold for buy signals
@@ -208,7 +165,6 @@ class TokenOpportunity:
     composite_score: float = 0.0
     entry_recommendation: str = "NEUTRAL"
     volatility: float = 0.0
-    stop_loss_pct: float = 0.0
     returns_vec: List[float] = field(default_factory=list)
     # Enhanced scoring fields
     long_score: float = 0.0
@@ -240,7 +196,7 @@ class RegimeDetector:
         self.db_path = db_path
 
     def _get_db_connection(self):
-        return sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
+        return sqlite3.connect(self.db_path)
 
     def detect_regime(self, symbol="BTCUSDT", window=20):
         try:
@@ -276,36 +232,6 @@ class RegimeDetector:
         except Exception as e:
             logger.error(f"Error in regime detection: {e}", exc_info=True)
             return {"regime": "error", "confidence": 0.0, "details": str(e)}
-
-    # --- New advanced regime classification ---
-    def classify_regime_adv(self, symbol="BTCUSDT") -> str:
-        """Return one of trending_volatile, trending_calm, choppy, squeeze."""
-        try:
-            conn = self._get_db_connection()
-            query = """SELECT close FROM candles_900s WHERE symbol = ? ORDER BY timestamp DESC LIMIT 120"""
-            df = pd.read_sql_query(query, conn, params=(symbol,))
-            conn.close()
-            if len(df) < 60:
-                return "squeeze"
-            df['close'] = pd.to_numeric(df['close'])
-            df = df.iloc[::-1].reset_index(drop=True)
-            returns = df['close'].pct_change().dropna()
-            vol = returns.std()*100
-            vol_med = returns.rolling(60).std().median()*100 if len(returns)>=60 else vol
-            vol_percentile = 1.0 if vol_med == 0 else min(vol/vol_med, 2.0)
-            sma = df['close'].rolling(window=60).mean().iloc[-1]
-            trend_strength = abs(df['close'].iloc[-1]-sma)/sma if sma>0 else 0
-            volatile = vol > 1.5
-            trending = trend_strength > 0.01
-            if trending and volatile:
-                return 'trending_volatile'
-            if trending and not volatile:
-                return 'trending_calm'
-            if not trending and volatile:
-                return 'choppy'
-            return 'squeeze'
-        except Exception:
-            return 'squeeze'
 
 # --- Enhanced Scoring Engine ---
 class EnhancedScoringEngine:
@@ -398,7 +324,7 @@ class EnhancedScoringEngine:
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         rs = gain / loss
-        rsi = 100.0 - (100.0 / (1.0 + rs))
+        rsi = 100 - (100 / (1 + rs))
         return rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50.0
     
     def _detect_support_levels(self, df: pd.DataFrame) -> List[float]:
@@ -460,7 +386,7 @@ class EnhancedScoringEngine:
     def _get_correlation_returns(self, symbol: str) -> List[float]:
         """Get returns vector for correlation calculation"""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
+            conn = sqlite3.connect(self.db_path)
             query = """
                 SELECT close FROM candles 
                 WHERE symbol = ? 
@@ -511,10 +437,9 @@ class EnhancedTokenAnalyzer:
         self.regime_detector = RegimeDetector(db_path)
         self.token_list = DEFAULT_TOKENS
         self.scoring_engine = EnhancedScoringEngine(db_path)
-        self.MICRO_DB_CONN = None
 
     def _get_db_connection(self):
-        return sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
+        return sqlite3.connect(self.db_path)
 
     async def _fetch_historical_data_from_db(self, symbol: str) -> pd.DataFrame:
         """Fetch historical data from database"""
@@ -527,7 +452,7 @@ class EnhancedTokenAnalyzer:
                 LIMIT ?
             """
             
-            with sqlite3.connect(self.db_path, timeout=60, check_same_thread=False) as conn:
+            with sqlite3.connect(self.db_path) as conn:
                 df = pd.read_sql_query(query, conn, params=(symbol, ANALYSIS_CANDLE_LIMIT))
                 
             if df.empty:
@@ -690,26 +615,9 @@ class EnhancedTokenAnalyzer:
             price_4h = ((current_price - df["close"].iloc[-240]) / df["close"].iloc[-240] * 100) if len(df) >= 241 else 0.0  
             price_24h = ((current_price - df["close"].iloc[-1440]) / df["close"].iloc[-1440] * 100) if len(df) >= 1441 else 0.0
 
-            # New: 5-min price change & volatility-relative tier
-            price_change_5m = ((current_price - df["close"].iloc[-2]) / df["close"].iloc[-2]) if len(df) >= 2 else 0.0
-            rolling_std_20 = df["close"].pct_change().tail(21).std()  # 20 recent 5-m returns
-            signal_tier = self._get_signal_tier(price_change_5m, rolling_std_20) if ENABLE_ADAPTIVE_TIERS else "LEGACY"
-            if ENABLE_ADAPTIVE_TIERS:
-                logger.debug(f"{symbol} move_sigma tier {signal_tier}")
-
             # Enhanced feature extraction
             features = self.scoring_engine.extract_features(df, current_price)
-
-            # --- Microstructure stats (logging only) ---
-            if ENABLE_MICROSTRUCTURE_STATS:
-                spread, imb, max_imb = self._get_micro_stats(symbol)
-                logger.debug(f"{symbol} microstructure spread {spread:.6f} avgImb {imb:.4f}")
-
-            # Guard: if ALL engineered technical features are NaN or 0, skip token to avoid polluting score distribution
-            if all((val is None or (isinstance(val, (int, float)) and (np.isnan(val) or val == 0))) for val in features):
-                logger.warning(f"⚠️ Skipping {symbol}: all technical features are NaN/zero (stale or missing data)")
-                return None
-
+            
             # Calculate RSI
             rsi_val = self._calculate_rsi(df['close'])
             
@@ -795,48 +703,27 @@ class EnhancedTokenAnalyzer:
             final_long_score = max(0, raw_long_score - (raw_long_score * correlation_penalty))
             final_short_score = max(0, raw_short_score - (raw_short_score * correlation_penalty))
 
-            # Determine thresholds per category
-            category = 'memes' if symbol in MEME_TOKENS else 'majors'
-            long_thresh = TIERED_THRESHOLDS[category]['long']
-            short_thresh = TIERED_THRESHOLDS[category]['short']
-            if ENABLE_REGIME_THRESHOLDS and regime_info['regime'] in THRESHOLD_MATRIX:
-                long_thresh *= THRESHOLD_MATRIX[regime_info['regime']]['entry']
-                short_thresh *= THRESHOLD_MATRIX[regime_info['regime']]['entry']
-            
-            # Binary decisions using tiered thresholds
-            simple_long_action_val = "BUY_LONG" if final_long_score >= long_thresh else "DON'T_BUY_LONG"
-            simple_short_action_val = "SHORT" if final_short_score >= short_thresh else "DON'T_SHORT"
+            # Binary decisions
+            simple_long_action_val = "BUY_LONG" if final_long_score >= BUY_THRESHOLD else "DON'T_BUY_LONG"
+            simple_short_action_val = "SHORT" if final_short_score >= BUY_THRESHOLD else "DON'T_SHORT"
 
-            # Noise filter using sigma tiers
-            if ENABLE_ADAPTIVE_TIERS and ENABLE_REGIME_THRESHOLDS and regime_info['regime'] in THRESHOLD_MATRIX:
-                if abs(price_change_5m) < THRESHOLD_MATRIX[regime_info['regime']]['noise']:
-                    direction = "NEUTRAL"
-                    entry_recommendation = "WAIT"
-                else:
-                    # Determine primary direction using tiered thresholds (below)
-                    pass
+            # Determine primary direction
+            if final_long_score > final_short_score and final_long_score >= BUY_THRESHOLD:
+                direction = "LONG"
+                entry_recommendation = "BUY_LONG"
+            elif final_short_score > final_long_score and final_short_score >= BUY_THRESHOLD:
+                direction = "SHORT"
+                entry_recommendation = "SHORT"
             else:
-                # Determine primary direction using tiered thresholds
-                if final_long_score > final_short_score and final_long_score >= long_thresh:
-                    direction = "LONG"
-                    entry_recommendation = "BUY_LONG"
-                elif final_short_score > final_long_score and final_short_score >= short_thresh:
-                    direction = "SHORT"
-                    entry_recommendation = "SHORT"
-                else:
-                    direction = "NEUTRAL"
-                    entry_recommendation = "WAIT"
+                direction = "NEUTRAL"
+                entry_recommendation = "WAIT"
 
             # Volatility calculation
             volatility = df['close'].pct_change().rolling(20).std().iloc[-1] * 100 if len(df) >= 20 else 0.0
             
-            # Volatility-scaled stop-loss (applied to all tokens)
-            base_sl_pct = 8.0 if category == 'memes' else 12.0  # tighter for high-beta memes
-            stop_loss_pct = max(volatility * 1.2, base_sl_pct) if volatility > 0 else base_sl_pct
-            
             logger.info(f"📊 {symbol}: {scoring_method.upper()} | Raw: L={raw_long_score:.1f}/S={raw_short_score:.1f} | "
                        f"Final: L={final_long_score:.1f}/S={final_short_score:.1f} | Corr={correlation_penalty:.2f} | "
-                       f"Action: {simple_long_action_val}/{simple_short_action_val} | SL={stop_loss_pct:.1f}%")
+                       f"Action: {simple_long_action_val}/{simple_short_action_val}")
 
             return TokenOpportunity(
                 symbol=symbol,
@@ -852,7 +739,6 @@ class EnhancedTokenAnalyzer:
                 composite_score=max(final_long_score, final_short_score),
                 entry_recommendation=entry_recommendation,
                 volatility=volatility if not pd.isna(volatility) else 0.0,
-                stop_loss_pct=stop_loss_pct,
                 returns_vec=returns_vec,
                 # Enhanced scoring fields
                 long_score=final_long_score,
@@ -929,21 +815,6 @@ class EnhancedTokenAnalyzer:
             "opportunities": []
         }
         for opp in opportunities:
-            # --- Phase-1 prediction logging --------------------------------------
-            try:
-                pred_row = {
-                    "prediction_id": f"{opp.symbol}_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
-                    "symbol": opp.symbol,
-                    "timestamp": time.time(),
-                    "predicted_direction": opp.entry_recommendation,
-                    "predicted_magnitude": opp.composite_score,
-                    "model_version": results_metadata["analysis_version"],
-                    "feature_snapshot": json.dumps(asdict(opp), default=str),
-                }
-                prediction_db.insert_prediction(pred_row)
-            except Exception as e:
-                logger.warning(f"📄 Prediction log failed for {opp.symbol}: {e}")
-
             output_data["opportunities"].append({
                 "symbol": opp.symbol, "current_price": opp.current_price,
                 "composite_score": opp.composite_score, "long_score": opp.long_score, "short_score": opp.short_score,
@@ -955,7 +826,6 @@ class EnhancedTokenAnalyzer:
                 },
                 "simple_long_action": opp.simple_long_action, "simple_short_action": opp.simple_short_action,
                 "volatility": opp.volatility,
-                "stop_loss_pct": opp.stop_loss_pct,
                 # ML prediction fields
                 "ml_probability": getattr(opp, 'ml_probability', None),
                 "ml_signal": getattr(opp, 'ml_signal', None), 
@@ -1036,51 +906,13 @@ class EnhancedTokenAnalyzer:
         except:
             return False
 
-    def _get_signal_tier(self, price_change: float, rolling_std: float) -> str:
-        """Classify move into tier A/B/C/NONE based on sigma move."""
-        if rolling_std == 0:
-            return "NONE"
-        move_sigma = abs(price_change) / rolling_std
-        if move_sigma > 3.0:
-            return "A"
-        elif move_sigma > 2.0:
-            return "B"
-        elif move_sigma > 1.5:
-            return "C"
-        return "NONE"
-
-    def _get_micro_stats(self, symbol: str):
-        """Fetch latest microstructure stats for symbol (spread, imbalance, max_abs)."""
-        if not ENABLE_MICROSTRUCTURE_STATS:
-            return 0.0, 0.0, 0.0
-        try:
-            if self.MICRO_DB_CONN is None:
-                self.MICRO_DB_CONN = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
-            cur = self.MICRO_DB_CONN.cursor()
-            cur.execute(
-                """
-                SELECT avg_spread, avg_imbalance, max_abs_imbalance
-                FROM microstructure_stats WHERE symbol = ?
-                ORDER BY snapshot_ts DESC LIMIT 1
-                """,
-                (symbol,),
-            )
-            row = cur.fetchone()
-            if row:
-                return row[0] or 0.0, row[1] or 0.0, row[2] or 0.0
-        except Exception as exc:
-            logger.debug(f"microstructure stats fetch error for {symbol}: {exc}")
-        return 0.0, 0.0, 0.0
-
 async def main():
     start_time_main = time.time()
     logger.info(f"Starting enhanced multi-token analysis (version: enhanced_v2.4_cascade_final) from {__file__}...")
     
     analyzer = EnhancedTokenAnalyzer(DB_PATH)
     market_regime_info = analyzer.regime_detector.detect_regime()
-    regime_class = analyzer.regime_detector.classify_regime_adv()
     logger.info(f"Market Regime Detected: {market_regime_info}")
-    logger.info(f"Regime Class: {regime_class}")
     
     async with aiohttp.ClientSession() as session:
         api_fetch_start = time.time()
